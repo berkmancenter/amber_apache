@@ -3,6 +3,7 @@ language: c
 before_install:
   - sudo apt-get update > /dev/null
   - sudo apt-get install -y --force-yes apache2
+  - sudo apt-get install -y --force-yes httpd-devel
 
 install:
   - git clone https://github.com/berkmancenter/robustness_apache.git
