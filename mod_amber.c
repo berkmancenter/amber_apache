@@ -3,8 +3,24 @@
 #include "http_config.h"
 #include "http_protocol.h"
 #include "ap_config.h"
+#include "apr_strings.h"
 #include "http_log.h"
 #include "pcre.h"
+#include "amber_db.h"
+#include <sqlite3.h>
+
+#define AMBER_CACHE_ATTRIBUTES_ERROR -1
+#define AMBER_CACHE_ATTRIBUTES_FOUND 0
+#define AMBER_CACHE_ATTRIBUTES_EMPTY 1
+#define AMBER_CACHE_ATTRIBUTES_NOT_FOUND 2
+
+#define amber_debug(mess) ap_log_error(APLOG_MARK, APLOG_NOERRNO|APLOG_DEBUG, 0, f->r->server, mess)
+#define amber_debug1(mess,p1) ap_log_error(APLOG_MARK, APLOG_NOERRNO|APLOG_DEBUG, 0, f->r->server, mess, p1)
+#define amber_debug2(mess,p1,p2) ap_log_error(APLOG_MARK, APLOG_NOERRNO|APLOG_DEBUG, 0, f->r->server, mess, p1, p2)
+#define amber_debug4(mess,p1,p2,p3,p4) ap_log_error(APLOG_MARK, APLOG_NOERRNO|APLOG_DEBUG, 0, f->r->server, mess, p1, p2, p3, p4)
+#define amber_error(mess) ap_log_error(APLOG_MARK, APLOG_NOERRNO|APLOG_EMERG, 0, f->r->server, mess)
+#define amber_error1(mess,p1) ap_log_error(APLOG_MARK, APLOG_NOERRNO|APLOG_EMERG, 0, f->r->server, mess, p1)
+#define amber_error2(mess,p1,p2) ap_log_error(APLOG_MARK, APLOG_NOERRNO|APLOG_EMERG, 0, f->r->server, mess, p1, p2)
 
 /* Define our data types */
 typedef struct {
@@ -22,8 +38,42 @@ static int amber_should_apply_filter(ap_filter_t *f);
 static apr_bucket* amber_process_bucket(ap_filter_t *f, apr_bucket *bucket, const char *buffer, size_t buffer_size);
 static amber_matches_t find_links_in_buffer(ap_filter_t *f, const char *buffer, size_t buffer_size);
 static size_t amber_insert_attributes(ap_filter_t *f, amber_matches_t links, const char *old_buffer, size_t old_buffer_size, const char *new_buffer, size_t new_buffer_size);
-/* Define our module as an entity and assign a function for registering hooks  */
+static int amber_enqueue_url(ap_filter_t *f, sqlite3 *sqlite_handle, char *url);
 
+/* Database-related functions */
+static sqlite3 *amber_db_get_database(ap_filter_t *f, char *db_path);
+static int amber_db_finalize_statement (ap_filter_t *f, sqlite3_stmt *sqlite_statement);
+static int amber_db_close_database(ap_filter_t *f, sqlite3 *sqlite_handle);
+static sqlite3_stmt *amber_db_get_statement(ap_filter_t *f, sqlite3 *sqlite_handle, char *statement);
+static sqlite3_stmt *amber_db_get_url_lookup_query(ap_filter_t *f, sqlite3 *sqlite_handle);
+static sqlite3_stmt *amber_db_get_enqueue_url_query(ap_filter_t *f, sqlite3 *sqlite_handle);
+static int amber_db_get_attribute(ap_filter_t *f, sqlite3 *sqlite_handle, sqlite3_stmt *sqlite_statement, char * url, char **result);
+
+/* Utility functions (platform independent) */
+#define AMBER_ACTION_NONE     0
+#define AMBER_ACTION_HOVER    1
+#define AMBER_ACTION_POPUP    2
+#define AMBER_ACTION_CACHE    3
+#define AMBER_STATUS_DOWN     0
+#define AMBER_STATUS_UP       1
+#define AMBER_MAX_ATTRIBUTE_STRING 250
+
+typedef struct {
+    int        behavior_up;      /* Default behaviour when site is up */
+    int        behavior_down;    /* Default behaviour when site is down */
+    int        hover_delay_up;   /* Hover delay when site is up */
+    int        hover_delay_down; /* Hover delay when site is down */
+    char       country[2];
+    int        country_behavior_up;      /* Default behaviour when site is up */
+    int        country_behavior_down;    /* Default behaviour when site is down */
+    int        country_hover_delay_up;   /* Hover delay when site is up */
+    int        country_hover_delay_down; /* Hover delay when site is down */
+} amber_options_t;
+
+int amber_get_behavior(amber_options_t *options, unsigned char *out, int status);
+int amber_build_attribute(amber_options_t *options, unsigned char *out, char *location, int status, time_t date);
+
+/* Apache-specific module configuration  */
 module AP_MODULE_DECLARE_DATA   amber_module =
 {
     STANDARD20_MODULE_STUFF,
@@ -35,15 +85,12 @@ module AP_MODULE_DECLARE_DATA   amber_module =
     register_hooks   // Our hook registering function
 };
 
-
 /* register_hooks: Adds a hook to the httpd process */
 static void register_hooks(apr_pool_t *pool) 
 {
-    
     /* Hook the request handler */
     ap_hook_handler(amber_handler, NULL, NULL, APR_HOOK_LAST);
     ap_register_output_filter("amber-filter", amber_filter, NULL, AP_FTYPE_RESOURCE) ;
-
 }
 
 /* Handler - TODO: Remove */
@@ -76,10 +123,9 @@ static apr_status_t amber_filter(ap_filter_t *f, apr_bucket_brigade *bb)
 
     apr_status_t rv;
 
-    ap_log_error(APLOG_MARK, APLOG_EMERG, 0, f->r->server, "Filter start");
-
+    amber_debug("Filter start");
     if (!amber_should_apply_filter(f)) {
-        ap_log_error(APLOG_MARK, APLOG_EMERG, 0, f->r->server, "Skipping file");
+        amber_debug("Skipping file");
         return ap_pass_brigade(f->next, bb);
     }
 
@@ -92,7 +138,7 @@ static apr_status_t amber_filter(ap_filter_t *f, apr_bucket_brigade *bb)
     /* TODO - Save this brigade in the context, so we don't create one for each invocation */    
     if (!(outBB = apr_brigade_create(f->r->pool, f->c->bucket_alloc))) {
         /* Error - log the problem and don't process the brigade */
-        ap_log_error(APLOG_MARK, APLOG_EMERG, 0, f->r->server, "Amber: Could not create output buffer brigade");    
+        amber_error("Amber: Could not create output buffer brigade");    
         return ap_pass_brigade(f->next, bb);
     } 
 
@@ -104,14 +150,14 @@ static apr_status_t amber_filter(ap_filter_t *f, apr_bucket_brigade *bb)
 
     /* Main loop through which we process all the buckets in the brigade */
     while (bucket != APR_BRIGADE_SENTINEL(bb)) {
-        ap_log_error(APLOG_MARK, APLOG_EMERG, 0, f->r->server, "In bucket loop");
+        amber_debug("In bucket loop");
         next_bucket = APR_BUCKET_NEXT(bucket);
 
         /* This is a metadata bucket indicating the end of the brigade */
         if (APR_BUCKET_IS_EOS(bucket)) {
             APR_BUCKET_REMOVE(bucket);
             APR_BRIGADE_INSERT_TAIL(outBB, bucket);
-            ap_log_error(APLOG_MARK, APLOG_EMERG, 0, f->r->server, "Filter end");
+            amber_debug("Filter end");
             return ap_pass_brigade(f->next, outBB);
         }
 
@@ -167,7 +213,7 @@ static apr_status_t amber_filter(ap_filter_t *f, apr_bucket_brigade *bb)
  */
 static int amber_should_apply_filter(ap_filter_t *f) {
     
-    ap_log_error(APLOG_MARK, APLOG_EMERG, 0, f->r->server, "Amber: File type: %s", f->r->content_type);
+    amber_debug1("Amber: File type: %s", f->r->content_type);
     return (f && f->r && f->r->content_type && !strncmp("text/html", f->r->content_type, 9));
 }
 
@@ -195,10 +241,11 @@ static apr_bucket* amber_process_bucket(ap_filter_t *f, apr_bucket *bucket, cons
     size_t new_buffer_memory_allocated = buffer_size + (links.count * sizeof(char) * AMBER_ATTRIBUTES_SIZE);
     char *new_buffer = apr_bucket_alloc( new_buffer_memory_allocated, f->c->bucket_alloc);
 
-    // *** UPDATE THE BUFFER HERE *** //
     size_t new_bucket_size = amber_insert_attributes(f, links, buffer, buffer_size, new_buffer, new_buffer_memory_allocated);
+    if (0 == new_bucket_size) {
+        return bucket; /* An error, so just return the old bucket */
+    }
     
-    /* TODO - CHANGE THIS TO REFLECT THE ACTUAL SIZE OF THE NEW BUCKET */
     apr_bucket *new_bucket = apr_bucket_heap_create(new_buffer, new_bucket_size, NULL, f->c->bucket_alloc);
     return new_bucket;
 }
@@ -224,7 +271,7 @@ static amber_matches_t find_links_in_buffer(ap_filter_t *f, const char *buffer, 
 
     /* Compile the pattern to use */
     if (!(re = pcre_compile(pattern, PCRE_CASELESS, &pcre_error, &pcre_error_offset, NULL))) {
-        ap_log_error(APLOG_MARK, APLOG_EMERG, 0, f->r->server, "Amber: PCRE compilation failed at offset %d: %s", pcre_error_offset, pcre_error);
+        amber_error2("Amber: PCRE compilation failed at offset %d: %s", pcre_error_offset, pcre_error);
         return result;
     }
 
@@ -232,7 +279,7 @@ static amber_matches_t find_links_in_buffer(ap_filter_t *f, const char *buffer, 
     int subpattern_captures_count;
     int pcre_result;
     if ((pcre_result = pcre_fullinfo(re, NULL, PCRE_INFO_CAPTURECOUNT, &subpattern_captures_count)) < 0) {
-        ap_log_error(APLOG_MARK, APLOG_EMERG, 0, f->r->server, "Amber: PCRE subpattern capture count failed with code %d", pcre_result);
+        amber_error1("Amber: PCRE subpattern capture count failed with code %d", pcre_result);
         return result;
     }
 
@@ -250,7 +297,7 @@ static amber_matches_t find_links_in_buffer(ap_filter_t *f, const char *buffer, 
             break;
         }
         if (pcre_result < 0) {  /* An error occurred */
-            ap_log_error(APLOG_MARK, APLOG_EMERG, 0, f->r->server, "Amber: Error while matching regular expression %d", pcre_result);
+            amber_error1("Amber: Error while matching regular expression %d", pcre_result);
             break;
         }
         if (pcre_result > 0) { /* We have a match! */   
@@ -278,7 +325,7 @@ static amber_matches_t find_links_in_buffer(ap_filter_t *f, const char *buffer, 
             result.url[result.count][pcre_results_vector[3] - pcre_results_vector[2]] = 0; /* Null-terminate the string */
             result.count++;
 
-            ap_log_error(APLOG_MARK, APLOG_EMERG, 0, f->r->server, "Amber: Match: %s", result.url[result.count-1]);
+            amber_debug1("Amber: Match: %s", result.url[result.count-1]);
 
             pos += pcre_results_vector[1];
             remaining_buffer = buffer - pos + buffer_size;
@@ -297,7 +344,7 @@ static amber_matches_t find_links_in_buffer(ap_filter_t *f, const char *buffer, 
  * @param old_buffer_size size of old_buffer
  * @param new_buffer buffer which will contain the updated content (memory already allocated)
  * @param new_buffer_size memory allocated for the new buffer 
- * @return actual size of the new buffer
+ * @return actual size of the new buffer (or 0 on error)
  */
 static size_t amber_insert_attributes(ap_filter_t *f, amber_matches_t links, const char *old_buffer, size_t old_buffer_size, const char *new_buffer, size_t new_buffer_size) {
 
@@ -307,12 +354,22 @@ static size_t amber_insert_attributes(ap_filter_t *f, amber_matches_t links, con
     char *dest = (char *)new_buffer;
     int copy_size;
 
+    sqlite3 *sqlite_handle = amber_db_get_database(f, "/var/lib/amber/amber_apache.db");
+    if (!sqlite_handle) {
+        return 0;
+    }
+
+    sqlite3_stmt *sqlite_statement = amber_db_get_url_lookup_query(f,sqlite_handle);
+    if (!sqlite_statement) {
+        return 0;
+    }
+
     for (int i = 0; i < links.count; i++) {  
 
         /* Copy the data up to the insertion point for the next match */
         copy_size = links.insert_pos[i] + old_buffer - src;
         if (copy_size + dest >= new_buffer + new_buffer_size) {
-            ap_log_error(APLOG_MARK, APLOG_EMERG, 0, f->r->server, "Amber: Not enough memory allocated for new buffer");
+            amber_error("Amber: Not enough memory allocated for new buffer");
             // TODO: Is there anything sensible we can do here?
             break;
         }        
@@ -321,31 +378,381 @@ static size_t amber_insert_attributes(ap_filter_t *f, amber_matches_t links, con
         dest += copy_size;
 
         /* Get the attributes to insert, and copy them too */
-        char *insert = " data-testing='bananas' ";
-        copy_size = strlen(insert);
-        // ngx_int_t result = ngx_http_amber_get_attribute(r, sqlite_handle, sqlite_statement, links.url[i], insertion);
-        if (copy_size + dest >= new_buffer + new_buffer_size) {
-            ap_log_error(APLOG_MARK, APLOG_EMERG, 0, f->r->server, "Amber: Not enough memory allocated for new buffer");
-            // TODO: Is there anything sensible we can do here?
-            break;
+        char *insert;
+        int result = amber_db_get_attribute(f, sqlite_handle, sqlite_statement, links.url[i], &insert);
+
+        if (AMBER_CACHE_ATTRIBUTES_NOT_FOUND == result) {
+            /* If the URL is not found, queue it up to be cached later */
+            amber_enqueue_url(f, sqlite_handle, links.url[i]);
+        } else if (AMBER_CACHE_ATTRIBUTES_FOUND == result) {
+            /* If the URL is found, insert the attributes we got */
+            copy_size = strlen(insert);
+            if (copy_size + dest >= new_buffer + new_buffer_size) {
+                amber_error("Amber: Not enough memory allocated for new buffer");
+                // TODO: Is there anything sensible we can do here?
+                break;
+            }
+            memcpy(dest, insert, copy_size);
+            dest += copy_size;
         }
-        memcpy(dest, insert, copy_size);
-        dest += copy_size;
     }
+
+    amber_db_finalize_statement(f, sqlite_statement);
+    amber_db_close_database(f, sqlite_handle);
 
     /* Copy any remaining content after the last match */
     if (src < old_buffer + old_buffer_size) {
         copy_size = old_buffer + old_buffer_size - src;
         if (dest + copy_size >= new_buffer + new_buffer_size) {
-            ap_log_error(APLOG_MARK, APLOG_EMERG, 0, f->r->server, "Amber: Not enough memory allocated for new buffer");
+            amber_error("Amber: Not enough memory allocated for new buffer");
         } else {
             memcpy(dest, src, copy_size);
             dest += copy_size;
         }
     }
-
     /* Actual size of the new buffer */
     return dest - new_buffer;
+}
+
+/* ======================================================================== */
+/* Database access code - could be moved to a separate file                 */
+/* ======================================================================== */
+
+/** 
+ * Get a handle to the sqlite database
+ * @param f the filter
+ * @param db_path location of the sqlite database on disk
+ * @return handle to the open sqlite database. If failed to open, return null
+ */ 
+static sqlite3 *amber_db_get_database(ap_filter_t *f, char *db_path) {
+    sqlite3 *sqlite_handle;
+    int sqlite_rc;
+
+    sqlite_rc = sqlite3_open(db_path, &sqlite_handle);
+    if (sqlite_rc) {
+        /* GCC thinks these are not being used for some reason, so annotate to avoid compiler warnings */
+        /* TODO: See if we can remove these */
+        __attribute__ ((__unused__)) int extended_rc = sqlite3_extended_errcode(sqlite_handle);
+        __attribute__ ((__unused__)) const char * msg = sqlite3_errmsg(sqlite_handle);
+        ap_log_error(APLOG_MARK, APLOG_EMERG, 0, f->r->server,
+            "Amber: Error opening sqlite database (%d,%s). Make sure database file and its directory are writable", sqlite_rc, db_path);
+        sqlite3_close(sqlite_handle);
+        return NULL;
+    }
+    return sqlite_handle;
+}
+
+static int amber_db_finalize_statement (ap_filter_t *f, sqlite3_stmt *sqlite_statement) {
+    int sqlite_rc;
+    if ((sqlite_rc = sqlite3_finalize(sqlite_statement)) != SQLITE_OK) {
+        amber_error1("AMBER error finalizing statement (%d)", sqlite_rc);
+    }
+    return sqlite_rc;
+}
+
+/**
+ * Close the database
+ * @param f the filter
+ * @param sqlite_handle handle to the database to close
+ * @return sqlite3 status code
+ */
+static int amber_db_close_database(ap_filter_t *f, sqlite3 *sqlite_handle) {
+    int sqlite_rc;
+    if ((sqlite_rc = sqlite3_close(sqlite_handle)) != SQLITE_OK) {
+        amber_error1("Amber: error closing sqlite database (%d)", sqlite_rc);
+    }
+    return sqlite_rc;
+}
+
+/**
+ * Prepare a sql query
+ * @param f the filter
+ * @param sqlite_handle handle to the database to use
+ * @param statement SQL query with '?' for variable parameters
+ * @return sqlite_statement to be executed
+ */
+static sqlite3_stmt *amber_db_get_statement(ap_filter_t *f, sqlite3 *sqlite_handle, char *statement) {
+    sqlite3_stmt *sqlite_statement;
+    const char *query_tail;
+    int sqlite_rc = sqlite3_prepare_v2(sqlite_handle, statement, -1, &sqlite_statement, &query_tail);
+    if (sqlite_rc != SQLITE_OK) {
+        amber_error1("AMBER error creating sqlite prepared statement (%d)", sqlite_rc);
+        amber_db_close_database(f, sqlite_handle);
+        return NULL;
+    }
+    return sqlite_statement;
+}
+
+/**
+ * Prepare a sql query for retrieving information about a url
+ * @param f the filter
+ * @param sqlite_handle handle to the database to use
+ * @return sqlite_statement to be executed
+ */
+static sqlite3_stmt *amber_db_get_url_lookup_query(ap_filter_t *f, sqlite3 *sqlite_handle) {
+    return amber_db_get_statement(f, sqlite_handle, "SELECT aa.location, aa.date, ah.status FROM amber_cache aa, amber_check ah WHERE aa.url = ? AND aa.id = ah.id");
+}
+
+/**
+ * Prepare a sql query for enqueuing url
+ * @param f the filter
+ * @param sqlite_handle handle to the database to use
+ * @return sqlite_statement to be executed
+ */
+static sqlite3_stmt *amber_db_get_enqueue_url_query(ap_filter_t *f, sqlite3 *sqlite_handle) {
+    return amber_db_get_statement(f, sqlite_handle, "INSERT OR IGNORE INTO amber_queue (url, created) SELECT ?1,?2 where ?1 not in (select url from amber_exclude) and ?1 not in (select url from amber_check)");
+}
+
+/**
+ * Get the AMBER attributes that should be added to the HREF with the given target URL, based on data from the cache.
+ * @param f the filter
+ * @param sqlite_handle handle to the database to use
+ * @param sqlite_statement prepared statement to use in the query
+ * @param url to lookup
+ * @param result pointer to the attributes to be added (if any)
+ * @return status code indicating the results of the query:
+ *      AMBER_CACHE_ATTRIBUTES_ERROR - there was an error
+ *      AMBER_CACHE_ATTRIBUTES_FOUND - the URL was found and attributes to insert in the HREF are in the result parameter
+ *      AMBER_CACHE_ATTRIBUTES_EMPTY -  the URL was found, but there is no cache 
+ *      AMBER_CACHE_ATTRIBUTES_NOT_FOUND - the URL was not found
+ */
+static int amber_db_get_attribute(ap_filter_t *f, sqlite3 *sqlite_handle, sqlite3_stmt *sqlite_statement, char * url, char **result) {
+
+    int rc;
+    const char *location_tmp;
+    char *location;
+    int date;
+    int status;
+
+    /* Clear any existing bindings on the statement, in case it had been used before. sqlite3_reset does not do this */
+    if ((rc = sqlite3_clear_bindings(sqlite_statement)) != SQLITE_OK) {
+        amber_error2("Amber: error error clearing bindings: %s (%d)", url, rc);
+        return AMBER_CACHE_ATTRIBUTES_ERROR;
+    }
+
+    /* Reset the query to be executed again */
+    if ((rc = sqlite3_reset(sqlite_statement)) != SQLITE_OK) {
+        amber_error2("Amber: error reseting prepared statement: %s (%d)", url, rc);
+        return AMBER_CACHE_ATTRIBUTES_ERROR;
+    }
+
+    /* Bind parameter 1 - the URL to lookup */
+    if ((rc = sqlite3_bind_text(sqlite_statement, 1, url, strlen(url), SQLITE_STATIC)) != SQLITE_OK) {
+        amber_error2("Amber: error binding sqlite parameter: %s (%d)", url, rc);
+        return AMBER_CACHE_ATTRIBUTES_ERROR;
+    }
+
+    /* Get the first result (the only one we care about) */
+    rc = sqlite3_step(sqlite_statement);
+    if (rc == SQLITE_DONE) {                 /* No data returned */
+        return AMBER_CACHE_ATTRIBUTES_NOT_FOUND;
+    } else if (rc == SQLITE_ROW) {           /* Some data found - extract the results */
+        /* Copy the location string, since it gets clobbered when the sqlite objects are closed */
+        location = apr_pstrdup(f->r->pool, (const char *) sqlite3_column_text(sqlite_statement, 0));
+        date = sqlite3_column_int(sqlite_statement,1);
+        status = sqlite3_column_int(sqlite_statement,2);
+        amber_debug4("Amber: sqlite results for url: (%s) %s, %d, %d", url, location, date, status);
+    } else {
+        amber_error1("Amber: error executing sqlite statement: (%d)", rc);
+        return AMBER_CACHE_ATTRIBUTES_ERROR;
+    }
+
+    /* If the location is empty, no cache exists */
+    if (strlen(location) == 0) {
+        return AMBER_CACHE_ATTRIBUTES_EMPTY;
+    } else {
+        // ngx_http_amber_loc_conf_t  *amber_config;
+        // amber_config = ngx_http_get_module_loc_conf(r, ngx_http_amber_filter_module);
+
+        amber_options_t options = {
+            .behavior_up=AMBER_ACTION_HOVER,
+            .behavior_down=AMBER_ACTION_POPUP,
+            .hover_delay_up=0};
+        char *attribute = apr_pcalloc(f->r->pool, AMBER_MAX_ATTRIBUTE_STRING * sizeof(char));
+        if ((rc = amber_build_attribute(&options, (unsigned char *)attribute, location, status, date))) {
+            amber_error1("Amber: error generating attribute string (%d)", rc);
+            return AMBER_CACHE_ATTRIBUTES_ERROR;
+        }
+        amber_debug2("Amber: attribute string for url: (%s) : %s", url, attribute);
+        *result = attribute;
+    }
+
+    return AMBER_CACHE_ATTRIBUTES_FOUND;
+}
+
+/**
+ * Add the URL to the amber_queue table so that it will be cached during the next caching run
+ * @param f the filter
+ * @param sqlite_handle handle to the database to use
+ * @param url to enqueue
+ * @return 0 on success
+*/
+static int amber_enqueue_url(ap_filter_t *f, sqlite3 *sqlite_handle, char *url) {
+    int sqlite_rc;
+
+    sqlite3_stmt *sqlite_statement = amber_db_get_enqueue_url_query(f, sqlite_handle);
+    if (!sqlite_statement) {
+        return -1;
+     }
+
+    if ((sqlite_rc = sqlite3_bind_text(sqlite_statement, 1, url, strlen(url), SQLITE_STATIC)) != SQLITE_OK) {
+        amber_error2("Amber: error binding sqlite parameter: %s (%d)", url, sqlite_rc);
+        amber_db_finalize_statement(f ,sqlite_statement);
+        return -1;
+    }
+    sqlite_rc = sqlite3_bind_int(sqlite_statement, 2, time(NULL));
+    if (sqlite_rc != SQLITE_OK) {
+        amber_error2("Amber: error binding sqlite parameter: %s (%d)", "time()", sqlite_rc);
+        amber_db_finalize_statement(f ,sqlite_statement);
+        return -1;
+    }
+    sqlite_rc = sqlite3_step(sqlite_statement);
+    if (sqlite_rc == SQLITE_DONE) { /* No data returned */
+        amber_debug1("Enqueued URL: %s", url);
+    } else {
+        amber_debug2("Error enqueuing URL: %s (%d)", url, sqlite_rc);
+        amber_error("Amber: error writing sqlite database. Make sure database file and its directory are writable");
+    }
+    amber_db_finalize_statement(f, sqlite_statement);
+    return 0;
+}
+
+
+/* ======================================================================== */
+/* Amber Utilities - from amber_utils.c in robustness_nginx                 */   
+/* Platform-independent and could be moved to a separate file               */
+/* ======================================================================== */
+
+#define AMBER_MAX_BEHAVIOR_STRING 20
+#define AMBER_MAX_DATE_STRING 30
+
+/* Create a string containing attributes to be added to the HREF
+
+    amber_options_t *options : configuration settings
+    char *out               : buffer to where the attribute is written
+    chatr *locatino         : location of the cached copy
+    int status              : whether the site is up or down
+    time_t date             : when the cache was generated (unix epoch)
+
+    returns 0 on success
+*/
+int amber_build_attribute(amber_options_t *options, unsigned char *out, char *location, int status, time_t date)
+{
+    unsigned char behavior[AMBER_MAX_BEHAVIOR_STRING];
+    char date_string[AMBER_MAX_DATE_STRING];
+
+    int rc = amber_get_behavior(options, behavior, status);
+    if (!rc) {
+        struct tm *timeinfo = localtime(&date);
+        strftime(date_string,AMBER_MAX_DATE_STRING,"%FT%T%z",timeinfo);
+        snprintf((char *)out,
+                 AMBER_MAX_ATTRIBUTE_STRING,
+                 "data-cache='/%s %s' data-amber-behavior='%s' ",
+                 location,
+                 date_string,
+                 behavior
+                 );
+         }
+
+    return rc;
+}
+
+/* Get the contents of behavior attribute based on the status of the link
+   and the configuration settings.
+
+   amber_options_t *options : configuration settings
+   char *out               : buffer to where the attribute is written
+   int status              : whether the site is up or down
+
+   returns 0 on success
+
+   TODO: Country-specific behavior
+   */
+int amber_get_behavior(amber_options_t *options, unsigned char *out, int status) {
+    if (!options || !out) {
+        return 1;
+    }
+    if (status == AMBER_STATUS_UP) {
+        switch (options->behavior_up) {
+            case AMBER_ACTION_HOVER:
+                snprintf((char *)out,
+                         AMBER_MAX_ATTRIBUTE_STRING,
+                         "up hover:%d",
+                         options->hover_delay_up);
+                break;
+            case AMBER_ACTION_POPUP:
+                snprintf((char *)out, AMBER_MAX_ATTRIBUTE_STRING, "up popup");
+                break;
+            case AMBER_ACTION_CACHE:
+                snprintf((char *)out, AMBER_MAX_ATTRIBUTE_STRING, "up cache");
+                break;
+            case AMBER_ACTION_NONE:
+                break;
+        }
+    } else if (status == AMBER_STATUS_DOWN) {
+        switch (options->behavior_down) {
+            case AMBER_ACTION_HOVER:
+                snprintf((char *)out,
+                         AMBER_MAX_ATTRIBUTE_STRING,
+                         "down hover:%d",
+                         options->hover_delay_down);
+                break;
+            case AMBER_ACTION_POPUP:
+                snprintf((char *)out, AMBER_MAX_ATTRIBUTE_STRING, "down popup");
+                break;
+            case AMBER_ACTION_CACHE:
+                snprintf((char *)out, AMBER_MAX_ATTRIBUTE_STRING, "down cache");
+                break;
+            case AMBER_ACTION_NONE:
+                break;
+
+        }
+    }
+    if (strlen(options->country)) {
+        char country_attribute[AMBER_MAX_ATTRIBUTE_STRING];
+        if (status == AMBER_STATUS_UP) {
+            switch (options->country_behavior_up) {
+                case AMBER_ACTION_HOVER:
+                    snprintf(country_attribute,
+                             AMBER_MAX_ATTRIBUTE_STRING,
+                             ",%s up hover:%d",
+                             options->country,
+                             options->country_hover_delay_up);
+                    break;
+                case AMBER_ACTION_POPUP:
+                    snprintf(country_attribute, AMBER_MAX_ATTRIBUTE_STRING, ",%s up popup", options->country);
+                    break;
+                case AMBER_ACTION_CACHE:
+                    snprintf(country_attribute, AMBER_MAX_ATTRIBUTE_STRING, ",%s up cache", options->country);
+                    break;
+                case AMBER_ACTION_NONE:
+                    break;
+            }
+        } else if (status == AMBER_STATUS_DOWN) {
+            switch (options->country_behavior_down) {
+                case AMBER_ACTION_HOVER:
+                    snprintf(country_attribute,
+                             AMBER_MAX_ATTRIBUTE_STRING,
+                             ",%s down hover:%d",
+                             options->country,
+                             options->country_hover_delay_down);
+                    break;
+                case AMBER_ACTION_POPUP:
+                    snprintf(country_attribute, AMBER_MAX_ATTRIBUTE_STRING, ",%s down popup", options->country);
+                    break;
+                case AMBER_ACTION_CACHE:
+                    snprintf(country_attribute, AMBER_MAX_ATTRIBUTE_STRING, ",%s down cache", options->country);
+                    break;
+                case AMBER_ACTION_NONE:
+                    break;
+            }
+        }
+        if (strlen(country_attribute)) {
+            strncat((char *) out, country_attribute, AMBER_MAX_ATTRIBUTE_STRING - strlen((char *)out));
+        }
+    }
+
+    return 0;
 }
 
 
