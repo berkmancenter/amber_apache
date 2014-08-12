@@ -30,9 +30,29 @@ typedef struct {
     char  **url;        /* Array - urls within the buffer. */
 } amber_matches_t;
 
+typedef struct {
+    int        enabled;          
+    char *     database;                
+    int        behavior_up;      /* Default behaviour when site is up */
+    int        behavior_down;    /* Default behaviour when site is down */
+    int        hover_delay_up;   /* Hover delay when site is up */
+    int        hover_delay_down; /* Hover delay when site is down */
+    char *     country;
+    int        country_behavior_up;      /* Default behaviour when site is up */
+    int        country_behavior_down;    /* Default behaviour when site is down */
+    int        country_hover_delay_up;   /* Hover delay when site is up */
+    int        country_hover_delay_down; /* Hover delay when site is down */
+} amber_options_t;
+
+
 /* Define prototypes of our functions in this module */
 static void register_hooks(apr_pool_t *pool);
 static int amber_handler(request_rec *r);
+static void* amber_create_dir_conf(apr_pool_t* pool, char* x);
+static const char *amber_set_behavior_up(cmd_parms *cmd, void *cfg, const char *arg);
+static const char *amber_set_behavior_down(cmd_parms *cmd, void *cfg, const char *arg);
+static const char *amber_set_country_behavior_up(cmd_parms *cmd, void *cfg, const char *arg);
+static const char *amber_set_country_behavior_down(cmd_parms *cmd, void *cfg, const char *arg);
 static apr_status_t amber_filter(ap_filter_t *f, apr_bucket_brigade *bb);
 static int amber_should_apply_filter(ap_filter_t *f);
 static apr_bucket* amber_process_bucket(ap_filter_t *f, apr_bucket *bucket, const char *buffer, size_t buffer_size);
@@ -58,31 +78,35 @@ static int amber_db_get_attribute(ap_filter_t *f, sqlite3 *sqlite_handle, sqlite
 #define AMBER_STATUS_UP       1
 #define AMBER_MAX_ATTRIBUTE_STRING 250
 
-typedef struct {
-    int        behavior_up;      /* Default behaviour when site is up */
-    int        behavior_down;    /* Default behaviour when site is down */
-    int        hover_delay_up;   /* Hover delay when site is up */
-    int        hover_delay_down; /* Hover delay when site is down */
-    char       country[2];
-    int        country_behavior_up;      /* Default behaviour when site is up */
-    int        country_behavior_down;    /* Default behaviour when site is down */
-    int        country_hover_delay_up;   /* Hover delay when site is up */
-    int        country_hover_delay_down; /* Hover delay when site is down */
-} amber_options_t;
-
 int amber_get_behavior(amber_options_t *options, unsigned char *out, int status);
 int amber_build_attribute(amber_options_t *options, unsigned char *out, char *location, int status, time_t date);
 
 /* Apache-specific module configuration  */
+static const command_rec amber_directives[] =
+{
+    AP_INIT_FLAG("AmberEnabled", ap_set_flag_slot, (void*)APR_OFFSETOF(amber_options_t, enabled), OR_ALL, "Enable Amber"),
+    AP_INIT_TAKE1("AmberDatabase", ap_set_file_slot, (void*)APR_OFFSETOF(amber_options_t, database), OR_ALL, "Location of the Amber database"),
+    AP_INIT_TAKE1("AmberBehaviorUp", amber_set_behavior_up, NULL, OR_ALL, "Set the behavior for links that are available"),
+    AP_INIT_TAKE1("AmberBehaviorDown", amber_set_behavior_down, NULL, OR_ALL, "Set the behavior for links that are not available"),
+    AP_INIT_TAKE1("AmberHoverDelayUp", ap_set_int_slot, (void*)APR_OFFSETOF(amber_options_t, hover_delay_up), OR_ALL, "Set the hover delay for links that are available"),
+    AP_INIT_TAKE1("AmberHoverDelayDown", ap_set_int_slot, (void*)APR_OFFSETOF(amber_options_t, hover_delay_down), OR_ALL, "Set the hover delay for links that are not available"),
+    AP_INIT_TAKE1("AmberCountry", ap_set_string_slot, (void*)APR_OFFSETOF(amber_options_t, country), OR_ALL, "Set the behavior for users from a particular country"),
+    AP_INIT_TAKE1("AmberCountryBehaviorUp", amber_set_country_behavior_up, NULL, OR_ALL, "Set the behavior for links that are available in the specified country"),
+    AP_INIT_TAKE1("AmberCountryBehaviorDown", amber_set_country_behavior_down, NULL, OR_ALL, "Set the behavior for links that are not available in the specified country"),
+    AP_INIT_TAKE1("AmberCountryHoverDelayUp", ap_set_int_slot, (void*)APR_OFFSETOF(amber_options_t, country_hover_delay_up), OR_ALL, "Set the hover delay for links that are available for the specified country"),
+    AP_INIT_TAKE1("AmberCountryHoverDelayDown", ap_set_int_slot, (void*)APR_OFFSETOF(amber_options_t, country_hover_delay_down), OR_ALL, "Set the hover delay for links that are not available for the specified country"),
+    { NULL }
+};
+
 module AP_MODULE_DECLARE_DATA   amber_module =
 {
     STANDARD20_MODULE_STUFF,
-    NULL,            // Per-directory configuration handler
-    NULL,            // Merge handler for per-directory configurations
-    NULL,            // Per-server configuration handler
-    NULL,            // Merge handler for per-server configurations
-    NULL,            // Any directives we may have for httpd
-    register_hooks   // Our hook registering function
+    amber_create_dir_conf,            // Per-directory configuration handler
+    NULL,                             // Merge handler for per-directory configurations
+    NULL,                             // Per-server configuration handler
+    NULL,                             // Merge handler for per-server configurations
+    amber_directives,                 // Any directives we may have for httpd
+    register_hooks                    // Our hook registering function
 };
 
 /* register_hooks: Adds a hook to the httpd process */
@@ -91,6 +115,69 @@ static void register_hooks(apr_pool_t *pool)
     /* Hook the request handler */
     ap_hook_handler(amber_handler, NULL, NULL, APR_HOOK_LAST);
     ap_register_output_filter("amber-filter", amber_filter, NULL, AP_FTYPE_RESOURCE) ;
+}
+
+/**
+ * Set the default values for the configuration directives. 
+ * Referenced from amber_module
+ */
+static void* amber_create_dir_conf(apr_pool_t* pool, char* x) {
+  amber_options_t* options = apr_pcalloc(pool, sizeof(amber_options_t));
+  
+  options->enabled = 0;
+  options->database = "/var/lib/amber/amber.db";
+  options->behavior_up = AMBER_ACTION_NONE;
+  options->behavior_down = AMBER_ACTION_HOVER;
+  options->hover_delay_up = 0;
+  options->hover_delay_down = 2;
+  options->country = "";
+  options->country_behavior_up = AMBER_ACTION_NONE;
+  options->country_behavior_down = AMBER_ACTION_HOVER;
+  options->country_hover_delay_up = 0;
+  options->country_hover_delay_down = 2;
+
+  return options ;
+}
+
+/** 
+ * Convert strings from a configuration file describing behavior into integers
+ * @param s description of behavior
+ * @return integer corresponding to one of out defined actions for cached content
+ */
+static int amber_convert_behavior_config(const char *s) {
+    if (!strcmp("cache",s)) {
+        return AMBER_ACTION_CACHE;
+    } else if (!strcmp("popup",s)) {
+        return AMBER_ACTION_POPUP;
+    } else if (!strcmp("hover",s)) {
+        return AMBER_ACTION_HOVER;
+    } else {
+        return AMBER_ACTION_NONE;
+    }
+}
+
+static const char *amber_set_behavior_up(cmd_parms *cmd, void *cfg, const char *arg)
+{
+    ((amber_options_t*)cfg)->behavior_up = amber_convert_behavior_config(arg);
+    return NULL;
+}
+
+static const char *amber_set_behavior_down(cmd_parms *cmd, void *cfg, const char *arg)
+{
+    ((amber_options_t*)cfg)->behavior_down = amber_convert_behavior_config(arg);
+    return NULL;
+}
+
+static const char *amber_set_country_behavior_up(cmd_parms *cmd, void *cfg, const char *arg)
+{
+    ((amber_options_t*)cfg)->country_behavior_up = amber_convert_behavior_config(arg);
+    return NULL;
+}
+
+static const char *amber_set_country_behavior_down(cmd_parms *cmd, void *cfg, const char *arg)
+{
+    ((amber_options_t*)cfg)->country_behavior_down = amber_convert_behavior_config(arg);
+    return NULL;
 }
 
 /* Handler - TODO: Remove */
@@ -119,8 +206,6 @@ static apr_status_t amber_filter(ap_filter_t *f, apr_bucket_brigade *bb)
     apr_bucket_brigade  *outBB;
     const char          *buffer;
     size_t              buffer_size;
-    apr_read_type_e     read_mode;
-
     apr_status_t rv;
 
     amber_debug("Filter start");
@@ -145,7 +230,7 @@ static apr_status_t amber_filter(ap_filter_t *f, apr_bucket_brigade *bb)
 
     /* Start out with non-blocking reads, so that if we're reading from a stream, we don't 
        unecessarily block until the stream is complete */     
-    read_mode = APR_NONBLOCK_READ; 
+    apr_read_type_e read_mode = APR_NONBLOCK_READ; 
     bucket = APR_BRIGADE_FIRST(bb);
 
     /* Main loop through which we process all the buckets in the brigade */
@@ -214,7 +299,13 @@ static apr_status_t amber_filter(ap_filter_t *f, apr_bucket_brigade *bb)
 static int amber_should_apply_filter(ap_filter_t *f) {
     
     amber_debug1("Amber: File type: %s", f->r->content_type);
-    return (f && f->r && f->r->content_type && !strncmp("text/html", f->r->content_type, 9));
+    amber_options_t *options = (amber_options_t*) ap_get_module_config(f->r->per_dir_config, &amber_module); 
+    return (
+        f && 
+        f->r && 
+        f->r->content_type && 
+        options->enabled && 
+        !strncmp("text/html", f->r->content_type, 9));
 }
 
 /** 
@@ -354,7 +445,8 @@ static size_t amber_insert_attributes(ap_filter_t *f, amber_matches_t links, con
     char *dest = (char *)new_buffer;
     int copy_size;
 
-    sqlite3 *sqlite_handle = amber_db_get_database(f, "/var/lib/amber/amber_apache.db");
+    amber_options_t *options = (amber_options_t*) ap_get_module_config(f->r->per_dir_config, &amber_module); 
+    sqlite3 *sqlite_handle = amber_db_get_database(f, options->database);
     if (!sqlite_handle) {
         return 0;
     }
@@ -561,15 +653,10 @@ static int amber_db_get_attribute(ap_filter_t *f, sqlite3 *sqlite_handle, sqlite
     if (strlen(location) == 0) {
         return AMBER_CACHE_ATTRIBUTES_EMPTY;
     } else {
-        // ngx_http_amber_loc_conf_t  *amber_config;
-        // amber_config = ngx_http_get_module_loc_conf(r, ngx_http_amber_filter_module);
+        amber_options_t *options = (amber_options_t*) ap_get_module_config(f->r->per_dir_config, &amber_module); 
 
-        amber_options_t options = {
-            .behavior_up=AMBER_ACTION_HOVER,
-            .behavior_down=AMBER_ACTION_POPUP,
-            .hover_delay_up=0};
         char *attribute = apr_pcalloc(f->r->pool, AMBER_MAX_ATTRIBUTE_STRING * sizeof(char));
-        if ((rc = amber_build_attribute(&options, (unsigned char *)attribute, location, status, date))) {
+        if ((rc = amber_build_attribute(options, (unsigned char *)attribute, location, status, date))) {
             amber_error1("Amber: error generating attribute string (%d)", rc);
             return AMBER_CACHE_ATTRIBUTES_ERROR;
         }
@@ -642,18 +729,17 @@ int amber_build_attribute(amber_options_t *options, unsigned char *out, char *lo
     char date_string[AMBER_MAX_DATE_STRING];
 
     int rc = amber_get_behavior(options, behavior, status);
-    if (!rc) {
+    if (!rc && (strlen((char*)behavior) > 0)) {
         struct tm *timeinfo = localtime(&date);
         strftime(date_string,AMBER_MAX_DATE_STRING,"%FT%T%z",timeinfo);
         snprintf((char *)out,
-                 AMBER_MAX_ATTRIBUTE_STRING,
-                 "data-cache='/%s %s' data-amber-behavior='%s' ",
-                 location,
-                 date_string,
-                 behavior
-                 );
+             AMBER_MAX_ATTRIBUTE_STRING,
+             "data-cache='/%s %s' data-amber-behavior='%s' ",
+             location,
+             date_string,
+             behavior
+             );
          }
-
     return rc;
 }
 
@@ -687,6 +773,7 @@ int amber_get_behavior(amber_options_t *options, unsigned char *out, int status)
                 snprintf((char *)out, AMBER_MAX_ATTRIBUTE_STRING, "up cache");
                 break;
             case AMBER_ACTION_NONE:
+                snprintf((char *)out, AMBER_MAX_ATTRIBUTE_STRING, "");
                 break;
         }
     } else if (status == AMBER_STATUS_DOWN) {
@@ -704,6 +791,7 @@ int amber_get_behavior(amber_options_t *options, unsigned char *out, int status)
                 snprintf((char *)out, AMBER_MAX_ATTRIBUTE_STRING, "down cache");
                 break;
             case AMBER_ACTION_NONE:
+                snprintf((char *)out, AMBER_MAX_ATTRIBUTE_STRING, "");
                 break;
 
         }
