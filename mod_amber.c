@@ -39,18 +39,23 @@ typedef struct {
 
 /* Configuration settings */
 typedef struct {
-    int        enabled;          
-    char *     database;                
-    int        behavior_up;      /* Default behaviour when site is up */
-    int        behavior_down;    /* Default behaviour when site is down */
-    int        hover_delay_up;   /* Hover delay when site is up */
-    int        hover_delay_down; /* Hover delay when site is down */
-    char *     country;
+    int        enabled;                  /* Is Amber enabled? */
+    char *     database;                 /* Path to the sqlite database */
+    int        behavior_up;              /* Default behaviour when site is up */
+    int        behavior_down;            /* Default behaviour when site is down */
+    int        hover_delay_up;           /* Hover delay when site is up */
+    int        hover_delay_down;         /* Hover delay when site is down */
+    char *     country;                  /* Two-character country code for country-specific behavior */
     int        country_behavior_up;      /* Default behaviour when site is up */
     int        country_behavior_down;    /* Default behaviour when site is down */
     int        country_hover_delay_up;   /* Hover delay when site is up */
     int        country_hover_delay_down; /* Hover delay when site is down */
+    int        cache_delivery;          
 } amber_options_t;
+
+typedef struct {
+    int        activity_logged;
+} amber_context_t;
 
 /* Functions and callbacks specifically related to Apache integration */
 static void         register_hooks(apr_pool_t *pool);
@@ -64,9 +69,11 @@ static apr_status_t amber_filter(ap_filter_t *f, apr_bucket_brigade *bb);
 
 /* Other functions */
 static int              amber_should_apply_filter(ap_filter_t *f);
+static int              amber_is_cache_delivery(ap_filter_t *f);
 static apr_bucket*      amber_process_bucket(ap_filter_t *f, apr_bucket *bucket, const char *buffer, size_t buffer_size);
 static amber_matches_t  find_links_in_buffer(ap_filter_t *f, const char *buffer, size_t buffer_size);
 static size_t           amber_insert_attributes(ap_filter_t *f, amber_matches_t links, const char *old_buffer, size_t old_buffer_size, const char *new_buffer, size_t new_buffer_size);
+static int              amber_log_activity(ap_filter_t *f);
 
 /* Functions that interact with the database */
 static sqlite3*         amber_db_get_database(ap_filter_t *f, char *db_path);
@@ -76,6 +83,7 @@ static sqlite3_stmt*    amber_db_get_statement(ap_filter_t *f, sqlite3 *sqlite_h
 
 static sqlite3_stmt*    amber_db_get_url_lookup_query(ap_filter_t *f, sqlite3 *sqlite_handle);
 static sqlite3_stmt*    amber_db_get_enqueue_url_query(ap_filter_t *f, sqlite3 *sqlite_handle);
+static sqlite3_stmt*    amber_db_get_log_activity_query(ap_filter_t *f, sqlite3 *sqlite_handle);
 static int              amber_db_enqueue_url(ap_filter_t *f, sqlite3 *sqlite_handle, char *url);
 static int              amber_db_get_attribute(ap_filter_t *f, sqlite3 *sqlite_handle, sqlite3_stmt *sqlite_statement, char * url, char **result);
 
@@ -97,6 +105,7 @@ static const command_rec amber_directives[] =
     AP_INIT_TAKE1("AmberCountryBehaviorDown",   amber_set_country_behavior_down, NULL, ACCESS_CONF, "Set the behavior for links that are not available in the specified country"),
     AP_INIT_TAKE1("AmberCountryHoverDelayUp",   ap_set_int_slot, (void*)APR_OFFSETOF(amber_options_t, country_hover_delay_up), ACCESS_CONF, "Set the hover delay for links that are available for the specified country"),
     AP_INIT_TAKE1("AmberCountryHoverDelayDown", ap_set_int_slot, (void*)APR_OFFSETOF(amber_options_t, country_hover_delay_down), ACCESS_CONF, "Set the hover delay for links that are not available for the specified country"),
+    AP_INIT_FLAG("AmberCacheDelivery",          ap_set_flag_slot, (void*)APR_OFFSETOF(amber_options_t, cache_delivery), ACCESS_CONF, "Enable for directory from which cached content will be served "),
     { NULL }
 };
 
@@ -136,6 +145,7 @@ static void* amber_create_dir_conf(apr_pool_t* pool, char* x) {
         options->country_behavior_down = -1;
         options->country_hover_delay_up = -1;
         options->country_hover_delay_down = -1;
+        options->cache_delivery = -1;
     }
     return options ;
 }
@@ -148,11 +158,6 @@ static void* amber_merge_dir_conf(apr_pool_t* pool, void* BASE, void* ADD) {
     amber_options_t* add = ADD ;
     amber_options_t* conf = apr_palloc(pool, sizeof(amber_options_t)) ;
 
-    // add->hover_delay_up = add->enabled;
-    // add->country_hover_delay_up = base->enabled;
-    // add->enabled = 1;
-    // return add;
-
     conf->enabled                   =  ( add->enabled == -1 ) ? base->enabled : add->enabled ;
     conf->database                  =  ( !add->database ) ? base->database : add->database ;
     conf->behavior_up               =  ( add->behavior_up == -1 ) ? base->behavior_up : add->behavior_up ;
@@ -164,6 +169,7 @@ static void* amber_merge_dir_conf(apr_pool_t* pool, void* BASE, void* ADD) {
     conf->country_behavior_down     =  ( add->country_behavior_down == -1 ) ? base->country_behavior_down : add->country_behavior_down ;
     conf->country_hover_delay_up    =  ( add->country_hover_delay_up == -1 ) ? base->country_hover_delay_up : add->country_hover_delay_up ;
     conf->country_hover_delay_down  =  ( add->country_hover_delay_down == -1 ) ? base->country_hover_delay_down : add->country_hover_delay_down ;
+    conf->cache_delivery            =  ( add->cache_delivery == -1 ) ? base->cache_delivery : add->cache_delivery ;
     return conf ;
 }
 
@@ -221,9 +227,23 @@ static apr_status_t amber_filter(ap_filter_t *f, apr_bucket_brigade *bb)
     apr_bucket_brigade  *outBB;
     const char          *buffer;
     size_t              buffer_size;
-    apr_status_t rv;
+    apr_status_t        rv;
+    amber_context_t     *context;
 
     amber_debug("Filter start");
+    context = f->ctx;
+    if (!context) {
+        f->ctx = context = apr_palloc(f->r->pool, sizeof(amber_context_t));
+    }
+
+    if (amber_is_cache_delivery(f)) {
+        amber_debug("Delivering cached item");
+        if (!context->activity_logged) {
+            amber_log_activity(f);
+        }
+        return ap_pass_brigade(f->next, bb);
+    }
+
     if (!amber_should_apply_filter(f)) {
         amber_debug("Skipping file");
         return ap_pass_brigade(f->next, bb);
@@ -311,7 +331,8 @@ static apr_status_t amber_filter(ap_filter_t *f, apr_bucket_brigade *bb)
 }    
 
 /**
- * Determine whether or not our filter should process this request. We only want to process HTML files
+ * Determine whether or not our filter should process this request for link rewriting. 
+ * We only want to process HTML files where Amber is enabled
  * @param f the filter
  * @return true if the requests should be processed
  */
@@ -326,6 +347,18 @@ static int amber_should_apply_filter(ap_filter_t *f) {
         (1 == options->enabled) && 
         !strncmp("text/html", f->r->content_type, 9));
 }
+
+/**
+ * Determine whether this requests is serving cached content (not assets, but the primary content)
+ * If so, we'll want to take some action (logging activity, perhaps setting the content-type)
+ * @param f the filter
+ * @return true if this is a request for cached content 
+ */
+static int amber_is_cache_delivery(ap_filter_t *f) {    
+    amber_options_t *options = (amber_options_t*) ap_get_module_config(f->r->per_dir_config, &amber_module); 
+    return (options->cache_delivery == 1);
+}
+
 
 /** 
  * Create the updated bucket to be added to the output filter change
@@ -525,6 +558,67 @@ static size_t amber_insert_attributes(ap_filter_t *f, amber_matches_t links, con
     return dest - new_buffer;
 }
 
+/**
+ * Log a view of a cached item to the amber_activity table
+ * @param f the filter
+ * @return 0 on success
+ */
+static int amber_log_activity(ap_filter_t *f) {
+    int sqlite_rc;
+    char *uri = apr_pstrdup(f->r->pool, f->r->uri);
+
+    if (!uri) {
+        return -1;
+    }
+
+    /* Trim any trailing '/' */
+    if ((strlen(uri) > 0) && (uri[strlen(uri) - 1] == '/')) {
+        uri[strlen(uri) - 1] = 0;
+    }
+    char *pos = strrchr(uri, '/');
+    if (pos && pos[1]) {
+        pos++;
+        amber_debug1("Logging activity for cache item: [%s]", pos);
+
+        amber_options_t *options = (amber_options_t*) ap_get_module_config(f->r->per_dir_config, &amber_module); 
+        sqlite3 *sqlite_handle = amber_db_get_database(f, options->database);
+        if (!sqlite_handle) {
+            return -1;
+        }
+
+        sqlite3_stmt *sqlite_statement = amber_db_get_log_activity_query(f,sqlite_handle);
+        if (!sqlite_statement) {
+            return -1;
+        }
+
+        if ((sqlite_rc = sqlite3_bind_text(sqlite_statement, 1, pos, strlen(pos), SQLITE_STATIC)) != SQLITE_OK) {
+            amber_error2("Amber: error binding sqlite parameter: %s (%d)", pos, sqlite_rc);
+            amber_db_finalize_statement(f ,sqlite_statement);
+            return -1;
+        }
+
+        sqlite_rc = sqlite3_bind_int(sqlite_statement, 2, time(NULL));
+        if (sqlite_rc != SQLITE_OK) {
+            amber_error2("Amber: error binding sqlite parameter: %s (%d)", "time()", sqlite_rc);
+            amber_db_finalize_statement(f ,sqlite_statement);
+            return -1;
+        }
+
+        sqlite_rc = sqlite3_step(sqlite_statement);
+        if (sqlite_rc == SQLITE_DONE) { /* No data returned */
+            amber_debug1("Logged cache visit: %s", pos);
+        } else {
+            amber_debug2("Error logging cache visit: %s (%d)", pos, sqlite_rc);
+            amber_error("Amber: error writing sqlite database. Make sure database file and its directory are writable");
+        }
+        amber_db_finalize_statement(f, sqlite_statement);
+        amber_db_close_database(f, sqlite_handle);
+        return 0;
+
+    }
+    return 0;
+}
+
 /* ======================================================================== */
 /* Database access code - could be moved to a separate file                 */
 /* ======================================================================== */
@@ -613,6 +707,16 @@ static sqlite3_stmt *amber_db_get_url_lookup_query(ap_filter_t *f, sqlite3 *sqli
  */
 static sqlite3_stmt *amber_db_get_enqueue_url_query(ap_filter_t *f, sqlite3 *sqlite_handle) {
     return amber_db_get_statement(f, sqlite_handle, "INSERT OR IGNORE INTO amber_queue (url, created) SELECT ?1,?2 where ?1 not in (select url from amber_exclude) and ?1 not in (select url from amber_check)");
+}
+
+/**
+ * Prepare a sql query for logging activity
+ * @param f the filter
+ * @param sqlite_handle handle to the database to use
+ * @return sqlite_statement to be executed
+ */
+static sqlite3_stmt *amber_db_get_log_activity_query(ap_filter_t *f, sqlite3 *sqlite_handle) {
+    return amber_db_get_statement(f, sqlite_handle, "INSERT OR REPLACE INTO amber_activity (id, date, views) VALUES (?1, ?2, COALESCE ((SELECT views+1 from amber_activity where id = ?1), 1))");
 }
 
 /**
