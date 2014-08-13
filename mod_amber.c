@@ -978,7 +978,7 @@ int amber_get_behavior(amber_options_t *options, unsigned char *out, int status)
                 snprintf((char *)out, AMBER_MAX_ATTRIBUTE_STRING, "up cache");
                 break;
             case AMBER_ACTION_NONE:
-                out[0] = NULL;
+                out[0] = 0;
                 break;
         }
     } else if (status == AMBER_STATUS_DOWN) {
@@ -996,7 +996,7 @@ int amber_get_behavior(amber_options_t *options, unsigned char *out, int status)
                 snprintf((char *)out, AMBER_MAX_ATTRIBUTE_STRING, "down cache");
                 break;
             case AMBER_ACTION_NONE:
-                out[0] = NULL;
+                out[0] = 0;
                 break;
 
         }
