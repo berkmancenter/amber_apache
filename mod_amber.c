@@ -1,4 +1,3 @@
-/* Include the required headers from httpd */
 #include "httpd.h"
 #include "http_config.h"
 #include "http_protocol.h"
@@ -9,11 +8,19 @@
 #include "amber_db.h"
 #include <sqlite3.h>
 
+#define AMBER_ACTION_NONE     0
+#define AMBER_ACTION_HOVER    1
+#define AMBER_ACTION_POPUP    2
+#define AMBER_ACTION_CACHE    3
+#define AMBER_STATUS_DOWN     0
+#define AMBER_STATUS_UP       1
+#define AMBER_MAX_ATTRIBUTE_STRING 250
 #define AMBER_CACHE_ATTRIBUTES_ERROR -1
 #define AMBER_CACHE_ATTRIBUTES_FOUND 0
 #define AMBER_CACHE_ATTRIBUTES_EMPTY 1
 #define AMBER_CACHE_ATTRIBUTES_NOT_FOUND 2
 
+/* Macros for debug and error logging */
 #define amber_debug(mess) ap_log_error(APLOG_MARK, APLOG_NOERRNO|APLOG_DEBUG, 0, f->r->server, mess)
 #define amber_debug1(mess,p1) ap_log_error(APLOG_MARK, APLOG_NOERRNO|APLOG_DEBUG, 0, f->r->server, mess, p1)
 #define amber_debug2(mess,p1,p2) ap_log_error(APLOG_MARK, APLOG_NOERRNO|APLOG_DEBUG, 0, f->r->server, mess, p1, p2)
@@ -22,7 +29,7 @@
 #define amber_error1(mess,p1) ap_log_error(APLOG_MARK, APLOG_NOERRNO|APLOG_EMERG, 0, f->r->server, mess, p1)
 #define amber_error2(mess,p1,p2) ap_log_error(APLOG_MARK, APLOG_NOERRNO|APLOG_EMERG, 0, f->r->server, mess, p1, p2)
 
-/* Define our data types */
+/* Structure representing the complete list of URLs found within a chunk of HTML, with offsets */
 typedef struct {
     int   count;        /* Number of matching insertion positions and urls */
     int   *insert_pos;  /* Array - positions within the buffer where additional 
@@ -30,6 +37,7 @@ typedef struct {
     char  **url;        /* Array - urls within the buffer. */
 } amber_matches_t;
 
+/* Configuration settings */
 typedef struct {
     int        enabled;          
     char *     database;                
@@ -44,99 +52,119 @@ typedef struct {
     int        country_hover_delay_down; /* Hover delay when site is down */
 } amber_options_t;
 
-
-/* Define prototypes of our functions in this module */
-static void register_hooks(apr_pool_t *pool);
-static int amber_handler(request_rec *r);
-static void* amber_create_dir_conf(apr_pool_t* pool, char* x);
-static const char *amber_set_behavior_up(cmd_parms *cmd, void *cfg, const char *arg);
-static const char *amber_set_behavior_down(cmd_parms *cmd, void *cfg, const char *arg);
-static const char *amber_set_country_behavior_up(cmd_parms *cmd, void *cfg, const char *arg);
-static const char *amber_set_country_behavior_down(cmd_parms *cmd, void *cfg, const char *arg);
+/* Functions and callbacks specifically related to Apache integration */
+static void         register_hooks(apr_pool_t *pool);
+static void*        amber_create_dir_conf(apr_pool_t* pool, char* x);
+static void*        amber_merge_dir_conf(apr_pool_t* pool, void* BASE, void* ADD);
+static const char*  amber_set_behavior_up(cmd_parms *cmd, void *cfg, const char *arg);
+static const char*  amber_set_behavior_down(cmd_parms *cmd, void *cfg, const char *arg);
+static const char*  amber_set_country_behavior_up(cmd_parms *cmd, void *cfg, const char *arg);
+static const char*  amber_set_country_behavior_down(cmd_parms *cmd, void *cfg, const char *arg);
 static apr_status_t amber_filter(ap_filter_t *f, apr_bucket_brigade *bb);
-static int amber_should_apply_filter(ap_filter_t *f);
-static apr_bucket* amber_process_bucket(ap_filter_t *f, apr_bucket *bucket, const char *buffer, size_t buffer_size);
-static amber_matches_t find_links_in_buffer(ap_filter_t *f, const char *buffer, size_t buffer_size);
-static size_t amber_insert_attributes(ap_filter_t *f, amber_matches_t links, const char *old_buffer, size_t old_buffer_size, const char *new_buffer, size_t new_buffer_size);
-static int amber_enqueue_url(ap_filter_t *f, sqlite3 *sqlite_handle, char *url);
 
-/* Database-related functions */
-static sqlite3 *amber_db_get_database(ap_filter_t *f, char *db_path);
-static int amber_db_finalize_statement (ap_filter_t *f, sqlite3_stmt *sqlite_statement);
-static int amber_db_close_database(ap_filter_t *f, sqlite3 *sqlite_handle);
-static sqlite3_stmt *amber_db_get_statement(ap_filter_t *f, sqlite3 *sqlite_handle, char *statement);
-static sqlite3_stmt *amber_db_get_url_lookup_query(ap_filter_t *f, sqlite3 *sqlite_handle);
-static sqlite3_stmt *amber_db_get_enqueue_url_query(ap_filter_t *f, sqlite3 *sqlite_handle);
-static int amber_db_get_attribute(ap_filter_t *f, sqlite3 *sqlite_handle, sqlite3_stmt *sqlite_statement, char * url, char **result);
+/* Other functions */
+static int              amber_should_apply_filter(ap_filter_t *f);
+static apr_bucket*      amber_process_bucket(ap_filter_t *f, apr_bucket *bucket, const char *buffer, size_t buffer_size);
+static amber_matches_t  find_links_in_buffer(ap_filter_t *f, const char *buffer, size_t buffer_size);
+static size_t           amber_insert_attributes(ap_filter_t *f, amber_matches_t links, const char *old_buffer, size_t old_buffer_size, const char *new_buffer, size_t new_buffer_size);
+
+/* Functions that interact with the database */
+static sqlite3*         amber_db_get_database(ap_filter_t *f, char *db_path);
+static int              amber_db_finalize_statement (ap_filter_t *f, sqlite3_stmt *sqlite_statement);
+static int              amber_db_close_database(ap_filter_t *f, sqlite3 *sqlite_handle);
+static sqlite3_stmt*    amber_db_get_statement(ap_filter_t *f, sqlite3 *sqlite_handle, char *statement);
+
+static sqlite3_stmt*    amber_db_get_url_lookup_query(ap_filter_t *f, sqlite3 *sqlite_handle);
+static sqlite3_stmt*    amber_db_get_enqueue_url_query(ap_filter_t *f, sqlite3 *sqlite_handle);
+static int              amber_db_enqueue_url(ap_filter_t *f, sqlite3 *sqlite_handle, char *url);
+static int              amber_db_get_attribute(ap_filter_t *f, sqlite3 *sqlite_handle, sqlite3_stmt *sqlite_statement, char * url, char **result);
 
 /* Utility functions (platform independent) */
-#define AMBER_ACTION_NONE     0
-#define AMBER_ACTION_HOVER    1
-#define AMBER_ACTION_POPUP    2
-#define AMBER_ACTION_CACHE    3
-#define AMBER_STATUS_DOWN     0
-#define AMBER_STATUS_UP       1
-#define AMBER_MAX_ATTRIBUTE_STRING 250
-
 int amber_get_behavior(amber_options_t *options, unsigned char *out, int status);
 int amber_build_attribute(amber_options_t *options, unsigned char *out, char *location, int status, time_t date);
 
-/* Apache-specific module configuration  */
+/* Apache structure that defines how configuration settings should be handled */
 static const command_rec amber_directives[] =
 {
-    AP_INIT_FLAG("AmberEnabled", ap_set_flag_slot, (void*)APR_OFFSETOF(amber_options_t, enabled), OR_ALL, "Enable Amber"),
-    AP_INIT_TAKE1("AmberDatabase", ap_set_file_slot, (void*)APR_OFFSETOF(amber_options_t, database), OR_ALL, "Location of the Amber database"),
-    AP_INIT_TAKE1("AmberBehaviorUp", amber_set_behavior_up, NULL, OR_ALL, "Set the behavior for links that are available"),
-    AP_INIT_TAKE1("AmberBehaviorDown", amber_set_behavior_down, NULL, OR_ALL, "Set the behavior for links that are not available"),
-    AP_INIT_TAKE1("AmberHoverDelayUp", ap_set_int_slot, (void*)APR_OFFSETOF(amber_options_t, hover_delay_up), OR_ALL, "Set the hover delay for links that are available"),
-    AP_INIT_TAKE1("AmberHoverDelayDown", ap_set_int_slot, (void*)APR_OFFSETOF(amber_options_t, hover_delay_down), OR_ALL, "Set the hover delay for links that are not available"),
-    AP_INIT_TAKE1("AmberCountry", ap_set_string_slot, (void*)APR_OFFSETOF(amber_options_t, country), OR_ALL, "Set the behavior for users from a particular country"),
-    AP_INIT_TAKE1("AmberCountryBehaviorUp", amber_set_country_behavior_up, NULL, OR_ALL, "Set the behavior for links that are available in the specified country"),
-    AP_INIT_TAKE1("AmberCountryBehaviorDown", amber_set_country_behavior_down, NULL, OR_ALL, "Set the behavior for links that are not available in the specified country"),
-    AP_INIT_TAKE1("AmberCountryHoverDelayUp", ap_set_int_slot, (void*)APR_OFFSETOF(amber_options_t, country_hover_delay_up), OR_ALL, "Set the hover delay for links that are available for the specified country"),
-    AP_INIT_TAKE1("AmberCountryHoverDelayDown", ap_set_int_slot, (void*)APR_OFFSETOF(amber_options_t, country_hover_delay_down), OR_ALL, "Set the hover delay for links that are not available for the specified country"),
+    AP_INIT_FLAG("AmberEnabled",                ap_set_flag_slot, (void*)APR_OFFSETOF(amber_options_t, enabled), ACCESS_CONF, "Enable Amber"),
+    AP_INIT_TAKE1("AmberDatabase",              ap_set_file_slot, (void*)APR_OFFSETOF(amber_options_t, database), ACCESS_CONF, "Location of the Amber database"),
+    AP_INIT_TAKE1("AmberBehaviorUp",            amber_set_behavior_up, NULL, ACCESS_CONF, "Set the behavior for links that are available"),
+    AP_INIT_TAKE1("AmberBehaviorDown",          amber_set_behavior_down, NULL, ACCESS_CONF, "Set the behavior for links that are not available"),
+    AP_INIT_TAKE1("AmberHoverDelayUp",          ap_set_int_slot, (void*)APR_OFFSETOF(amber_options_t, hover_delay_up), ACCESS_CONF, "Set the hover delay for links that are available"),
+    AP_INIT_TAKE1("AmberHoverDelayDown",        ap_set_int_slot, (void*)APR_OFFSETOF(amber_options_t, hover_delay_down), ACCESS_CONF, "Set the hover delay for links that are not available"),
+    AP_INIT_TAKE1("AmberCountry",               ap_set_string_slot, (void*)APR_OFFSETOF(amber_options_t, country), ACCESS_CONF, "Set the behavior for users from a particular country"),
+    AP_INIT_TAKE1("AmberCountryBehaviorUp",     amber_set_country_behavior_up, NULL, ACCESS_CONF, "Set the behavior for links that are available in the specified country"),
+    AP_INIT_TAKE1("AmberCountryBehaviorDown",   amber_set_country_behavior_down, NULL, ACCESS_CONF, "Set the behavior for links that are not available in the specified country"),
+    AP_INIT_TAKE1("AmberCountryHoverDelayUp",   ap_set_int_slot, (void*)APR_OFFSETOF(amber_options_t, country_hover_delay_up), ACCESS_CONF, "Set the hover delay for links that are available for the specified country"),
+    AP_INIT_TAKE1("AmberCountryHoverDelayDown", ap_set_int_slot, (void*)APR_OFFSETOF(amber_options_t, country_hover_delay_down), ACCESS_CONF, "Set the hover delay for links that are not available for the specified country"),
     { NULL }
 };
 
+/* Main apache structure that defines this as an Apache module */
 module AP_MODULE_DECLARE_DATA   amber_module =
 {
     STANDARD20_MODULE_STUFF,
     amber_create_dir_conf,            // Per-directory configuration handler
-    NULL,                             // Merge handler for per-directory configurations
+    amber_merge_dir_conf,             // Merge handler for per-directory configurations
     NULL,                             // Per-server configuration handler
     NULL,                             // Merge handler for per-server configurations
     amber_directives,                 // Any directives we may have for httpd
     register_hooks                    // Our hook registering function
 };
 
-/* register_hooks: Adds a hook to the httpd process */
+/* Apache: Adds a hook to the httpd process */
 static void register_hooks(apr_pool_t *pool) 
 {
-    /* Hook the request handler */
-    ap_hook_handler(amber_handler, NULL, NULL, APR_HOOK_LAST);
     ap_register_output_filter("amber-filter", amber_filter, NULL, AP_FTYPE_RESOURCE) ;
 }
 
 /**
- * Set the default values for the configuration directives. 
- * Referenced from amber_module
+ * Apache: Set the default values for the configuration directives. 
  */
 static void* amber_create_dir_conf(apr_pool_t* pool, char* x) {
-  amber_options_t* options = apr_pcalloc(pool, sizeof(amber_options_t));
+    amber_options_t* options = apr_pcalloc(pool, sizeof(amber_options_t));
   
-  options->enabled = 0;
-  options->database = "/var/lib/amber/amber.db";
-  options->behavior_up = AMBER_ACTION_NONE;
-  options->behavior_down = AMBER_ACTION_HOVER;
-  options->hover_delay_up = 0;
-  options->hover_delay_down = 2;
-  options->country = "";
-  options->country_behavior_up = AMBER_ACTION_NONE;
-  options->country_behavior_down = AMBER_ACTION_HOVER;
-  options->country_hover_delay_up = 0;
-  options->country_hover_delay_down = 2;
+    if (options) {
+        options->enabled = -1;
+        options->database = NULL;
+        options->behavior_up = -1;
+        options->behavior_down = -1;
+        options->hover_delay_up = -1;
+        options->hover_delay_down = -1;
+        options->country = NULL;
+        options->country_behavior_up = -1;
+        options->country_behavior_down = -1;
+        options->country_hover_delay_up = -1;
+        options->country_hover_delay_down = -1;
+    }
+    return options ;
+}
 
-  return options ;
+/**
+ * Apache: Merge hierarchical configuration settings 
+ */
+static void* amber_merge_dir_conf(apr_pool_t* pool, void* BASE, void* ADD) {
+    amber_options_t* base = BASE ;
+    amber_options_t* add = ADD ;
+    amber_options_t* conf = apr_palloc(pool, sizeof(amber_options_t)) ;
+
+    // add->hover_delay_up = add->enabled;
+    // add->country_hover_delay_up = base->enabled;
+    // add->enabled = 1;
+    // return add;
+
+    conf->enabled                   =  ( add->enabled == -1 ) ? base->enabled : add->enabled ;
+    conf->database                  =  ( !add->database ) ? base->database : add->database ;
+    conf->behavior_up               =  ( add->behavior_up == -1 ) ? base->behavior_up : add->behavior_up ;
+    conf->behavior_down             =  ( add->behavior_down == -1 ) ? base->behavior_down : add->behavior_down ;
+    conf->hover_delay_up            =  ( add->hover_delay_up == -1 ) ? base->hover_delay_up : add->hover_delay_up ;
+    conf->hover_delay_down          =  ( add->hover_delay_down == -1 ) ? base->hover_delay_down : add->hover_delay_down ;
+    conf->country                   =  ( !add->country ) ? base->country : add->country ;
+    conf->country_behavior_up       =  ( add->country_behavior_up == -1 ) ? base->country_behavior_up : add->country_behavior_up ;
+    conf->country_behavior_down     =  ( add->country_behavior_down == -1 ) ? base->country_behavior_down : add->country_behavior_down ;
+    conf->country_hover_delay_up    =  ( add->country_hover_delay_up == -1 ) ? base->country_hover_delay_up : add->country_hover_delay_up ;
+    conf->country_hover_delay_down  =  ( add->country_hover_delay_down == -1 ) ? base->country_hover_delay_down : add->country_hover_delay_down ;
+    return conf ;
 }
 
 /** 
@@ -156,6 +184,7 @@ static int amber_convert_behavior_config(const char *s) {
     }
 }
 
+/* Callback functions for setting up some configuration settings */
 static const char *amber_set_behavior_up(cmd_parms *cmd, void *cfg, const char *arg)
 {
     ((amber_options_t*)cfg)->behavior_up = amber_convert_behavior_config(arg);
@@ -178,20 +207,6 @@ static const char *amber_set_country_behavior_down(cmd_parms *cmd, void *cfg, co
 {
     ((amber_options_t*)cfg)->country_behavior_down = amber_convert_behavior_config(arg);
     return NULL;
-}
-
-/* Handler - TODO: Remove */
-static int amber_handler(request_rec *r)
-{
-    /* First off, we need to check if this is a call for the "example" handler.
-     * If it is, we accept it and do our things, it not, we simply return DECLINED,
-     * and Apache will try somewhere else.
-     */
-    if (!r->handler || strcmp(r->handler, "amber-handler")) return (DECLINED);
-    
-    // The first thing we will do is write a simple "Hello, world!" back to the client.
-    ap_rputs("Hello, world!<br/>", r);
-    return OK;
 }
 
 /** 
@@ -237,6 +252,10 @@ static apr_status_t amber_filter(ap_filter_t *f, apr_bucket_brigade *bb)
     while (bucket != APR_BRIGADE_SENTINEL(bb)) {
         amber_debug("In bucket loop");
         next_bucket = APR_BUCKET_NEXT(bucket);
+        if (bucket == next_bucket) {
+            amber_error("Avoiding infinite bucket loop!");
+            return ap_pass_brigade(f->next, bb);
+        }
 
         /* This is a metadata bucket indicating the end of the brigade */
         if (APR_BUCKET_IS_EOS(bucket)) {
@@ -275,7 +294,7 @@ static apr_status_t amber_filter(ap_filter_t *f, apr_bucket_brigade *bb)
                 continue;
             } else {
                 /* Error - log the problem and don't process the rest of the brigade */
-                ap_log_error(APLOG_MARK, APLOG_EMERG, 0, f->r->server, "Amber: Error reading from bucket");    
+                amber_error("Error reading from bucket");    
                 return ap_pass_brigade(f->next, bb);
             }
         }
@@ -286,7 +305,7 @@ static apr_status_t amber_filter(ap_filter_t *f, apr_bucket_brigade *bb)
         bucket = next_bucket;
     }
 
-    ap_log_error(APLOG_MARK, APLOG_EMERG, 0, f->r->server, "Filter end");
+    amber_debug("Filter end");
 
     return ap_pass_brigade(f->next, outBB);
 }    
@@ -304,7 +323,7 @@ static int amber_should_apply_filter(ap_filter_t *f) {
         f && 
         f->r && 
         f->r->content_type && 
-        options->enabled && 
+        (1 == options->enabled) && 
         !strncmp("text/html", f->r->content_type, 9));
 }
 
@@ -475,7 +494,7 @@ static size_t amber_insert_attributes(ap_filter_t *f, amber_matches_t links, con
 
         if (AMBER_CACHE_ATTRIBUTES_NOT_FOUND == result) {
             /* If the URL is not found, queue it up to be cached later */
-            amber_enqueue_url(f, sqlite_handle, links.url[i]);
+            amber_db_enqueue_url(f, sqlite_handle, links.url[i]);
         } else if (AMBER_CACHE_ATTRIBUTES_FOUND == result) {
             /* If the URL is found, insert the attributes we got */
             copy_size = strlen(insert);
@@ -520,6 +539,7 @@ static sqlite3 *amber_db_get_database(ap_filter_t *f, char *db_path) {
     sqlite3 *sqlite_handle;
     int sqlite_rc;
 
+    amber_debug1("Database: %s", db_path);
     sqlite_rc = sqlite3_open(db_path, &sqlite_handle);
     if (sqlite_rc) {
         /* GCC thinks these are not being used for some reason, so annotate to avoid compiler warnings */
@@ -674,7 +694,7 @@ static int amber_db_get_attribute(ap_filter_t *f, sqlite3 *sqlite_handle, sqlite
  * @param url to enqueue
  * @return 0 on success
 */
-static int amber_enqueue_url(ap_filter_t *f, sqlite3 *sqlite_handle, char *url) {
+static int amber_db_enqueue_url(ap_filter_t *f, sqlite3 *sqlite_handle, char *url) {
     int sqlite_rc;
 
     sqlite3_stmt *sqlite_statement = amber_db_get_enqueue_url_query(f, sqlite_handle);
