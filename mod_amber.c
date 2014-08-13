@@ -243,8 +243,8 @@ static apr_status_t amber_filter(ap_filter_t *f, apr_bucket_brigade *bb)
         amber_debug("Delivering cached item");
         if (!context->activity_logged) {
             amber_log_activity(f);
+            amber_set_cache_content_type(f);
         }
-        amber_set_cache_content_type(f);
         return ap_pass_brigade(f->next, bb);
     }
 
