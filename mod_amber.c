@@ -5,7 +5,6 @@
 #include "apr_strings.h"
 #include "http_log.h"
 #include "pcre.h"
-#include "amber_db.h"
 #include <sqlite3.h>
 
 #define AMBER_ACTION_NONE     0
