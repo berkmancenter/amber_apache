@@ -73,7 +73,9 @@ static int              amber_is_cache_delivery(ap_filter_t *f);
 static apr_bucket*      amber_process_bucket(ap_filter_t *f, apr_bucket *bucket, const char *buffer, size_t buffer_size);
 static amber_matches_t  find_links_in_buffer(ap_filter_t *f, const char *buffer, size_t buffer_size);
 static size_t           amber_insert_attributes(ap_filter_t *f, amber_matches_t links, const char *old_buffer, size_t old_buffer_size, const char *new_buffer, size_t new_buffer_size);
+static char*            get_cache_item_id(ap_filter_t *f);
 static int              amber_log_activity(ap_filter_t *f);
+static int              amber_set_cache_content_type(ap_filter_t *f);
 
 /* Functions that interact with the database */
 static sqlite3*         amber_db_get_database(ap_filter_t *f, char *db_path);
@@ -84,6 +86,7 @@ static sqlite3_stmt*    amber_db_get_statement(ap_filter_t *f, sqlite3 *sqlite_h
 static sqlite3_stmt*    amber_db_get_url_lookup_query(ap_filter_t *f, sqlite3 *sqlite_handle);
 static sqlite3_stmt*    amber_db_get_enqueue_url_query(ap_filter_t *f, sqlite3 *sqlite_handle);
 static sqlite3_stmt*    amber_db_get_log_activity_query(ap_filter_t *f, sqlite3 *sqlite_handle);
+static sqlite3_stmt*    amber_db_get_content_type_query(ap_filter_t *f, sqlite3 *sqlite_handle);
 static int              amber_db_enqueue_url(ap_filter_t *f, sqlite3 *sqlite_handle, char *url);
 static int              amber_db_get_attribute(ap_filter_t *f, sqlite3 *sqlite_handle, sqlite3_stmt *sqlite_statement, char * url, char **result);
 
@@ -241,6 +244,7 @@ static apr_status_t amber_filter(ap_filter_t *f, apr_bucket_brigade *bb)
         if (!context->activity_logged) {
             amber_log_activity(f);
         }
+        amber_set_cache_content_type(f);
         return ap_pass_brigade(f->next, bb);
     }
 
@@ -559,26 +563,43 @@ static size_t amber_insert_attributes(ap_filter_t *f, amber_matches_t links, con
 }
 
 /**
- * Log a view of a cached item to the amber_activity table
+ * Get the cache id of an item being served from the cache in the current request
  * @param f the filter
- * @return 0 on success
+ * @return pointer to cache id, or null if not found
  */
-static int amber_log_activity(ap_filter_t *f) {
-    int sqlite_rc;
+static char* get_cache_item_id(ap_filter_t *f) {
+
     char *uri = apr_pstrdup(f->r->pool, f->r->uri);
 
     if (!uri) {
-        return -1;
+        return NULL;
     }
 
     /* Trim any trailing '/' */
     if ((strlen(uri) > 0) && (uri[strlen(uri) - 1] == '/')) {
         uri[strlen(uri) - 1] = 0;
     }
+
     char *pos = strrchr(uri, '/');
     if (pos && pos[1]) {
         pos++;
-        amber_debug1("Logging activity for cache item: [%s]", pos);
+        return pos;
+    } else {
+        return NULL;
+    }
+}
+
+/**
+ * Log a view of a cached item to the amber_activity table
+ * @param f the filter
+ * @return 0 on success
+ */
+static int amber_log_activity(ap_filter_t *f) {
+    int sqlite_rc;
+    char *cache_id = get_cache_item_id(f);
+
+    if (cache_id) {
+        amber_debug1("Logging activity for cache item: [%s]", cache_id);
 
         amber_options_t *options = (amber_options_t*) ap_get_module_config(f->r->per_dir_config, &amber_module); 
         sqlite3 *sqlite_handle = amber_db_get_database(f, options->database);
@@ -591,8 +612,8 @@ static int amber_log_activity(ap_filter_t *f) {
             return -1;
         }
 
-        if ((sqlite_rc = sqlite3_bind_text(sqlite_statement, 1, pos, strlen(pos), SQLITE_STATIC)) != SQLITE_OK) {
-            amber_error2("Amber: error binding sqlite parameter: %s (%d)", pos, sqlite_rc);
+        if ((sqlite_rc = sqlite3_bind_text(sqlite_statement, 1, cache_id, strlen(cache_id), SQLITE_STATIC)) != SQLITE_OK) {
+            amber_error2("Amber: error binding sqlite parameter: %s (%d)", cache_id, sqlite_rc);
             amber_db_finalize_statement(f ,sqlite_statement);
             return -1;
         }
@@ -601,20 +622,71 @@ static int amber_log_activity(ap_filter_t *f) {
         if (sqlite_rc != SQLITE_OK) {
             amber_error2("Amber: error binding sqlite parameter: %s (%d)", "time()", sqlite_rc);
             amber_db_finalize_statement(f ,sqlite_statement);
+            amber_db_close_database(f, sqlite_handle);
             return -1;
         }
 
         sqlite_rc = sqlite3_step(sqlite_statement);
         if (sqlite_rc == SQLITE_DONE) { /* No data returned */
-            amber_debug1("Logged cache visit: %s", pos);
+            amber_debug1("Logged cache visit: %s", cache_id);
         } else {
-            amber_debug2("Error logging cache visit: %s (%d)", pos, sqlite_rc);
+            amber_debug2("Error logging cache visit: %s (%d)", cache_id, sqlite_rc);
             amber_error("Amber: error writing sqlite database. Make sure database file and its directory are writable");
         }
         amber_db_finalize_statement(f, sqlite_statement);
         amber_db_close_database(f, sqlite_handle);
         return 0;
 
+    }
+    return 0;
+}
+
+/**
+ * Set the content-type of a cached item that we're returning from the cache
+ * @param f the filter
+ * @return 0 on success
+ */
+static int amber_set_cache_content_type(ap_filter_t *f) {
+    int sqlite_rc;
+    char *cache_id = get_cache_item_id(f);
+
+    if (cache_id) {
+        amber_debug1("Setting content type for cache item: [%s]", cache_id);
+
+        amber_options_t *options = (amber_options_t*) ap_get_module_config(f->r->per_dir_config, &amber_module); 
+        sqlite3 *sqlite_handle = amber_db_get_database(f, options->database);
+        if (!sqlite_handle) {
+            return -1;
+        }
+
+        sqlite3_stmt *sqlite_statement = amber_db_get_content_type_query(f,sqlite_handle);
+        if (!sqlite_statement) {
+            return -1;
+        }
+
+        if ((sqlite_rc = sqlite3_bind_text(sqlite_statement, 1, cache_id, strlen(cache_id), SQLITE_STATIC)) != SQLITE_OK) {
+            amber_error2("Amber: error binding sqlite parameter: %s (%d)", cache_id, sqlite_rc);
+            amber_db_finalize_statement(f ,sqlite_statement);
+            amber_db_close_database(f, sqlite_handle);
+            return -1;
+        }
+
+        sqlite_rc = sqlite3_step(sqlite_statement);
+        if (sqlite_rc == SQLITE_DONE) { /* No data returned */
+            amber_debug1("No content type found when serving cache item: %s", cache_id); 
+        } else if (sqlite_rc == SQLITE_ROW) {
+            char *mimetype = (char *)sqlite3_column_text(sqlite_statement,0);
+            strncpy((char *)f->r->content_type, mimetype, strlen(mimetype));
+            amber_debug2("Set content type for cache item (%s): %s", cache_id, mimetype);
+
+        } else {
+            amber_error2("Error retrieving cache item content type: %s (%d)", cache_id, sqlite_rc);
+            amber_db_finalize_statement(f, sqlite_statement);
+            amber_db_close_database(f, sqlite_handle);
+            return -1;
+        }
+        amber_db_finalize_statement(f, sqlite_statement);
+        amber_db_close_database(f, sqlite_handle);
     }
     return 0;
 }
@@ -717,6 +789,16 @@ static sqlite3_stmt *amber_db_get_enqueue_url_query(ap_filter_t *f, sqlite3 *sql
  */
 static sqlite3_stmt *amber_db_get_log_activity_query(ap_filter_t *f, sqlite3 *sqlite_handle) {
     return amber_db_get_statement(f, sqlite_handle, "INSERT OR REPLACE INTO amber_activity (id, date, views) VALUES (?1, ?2, COALESCE ((SELECT views+1 from amber_activity where id = ?1), 1))");
+}
+
+/**
+ * Prepare a sql query for getting the mime-type of a cached item
+ * @param f the filter
+ * @param sqlite_handle handle to the database to use
+ * @return sqlite_statement to be executed
+ */
+static sqlite3_stmt *amber_db_get_content_type_query(ap_filter_t *f, sqlite3 *sqlite_handle) {
+    return amber_db_get_statement(f, sqlite_handle, "SELECT type FROM amber_cache WHERE id = ?");
 }
 
 /**
