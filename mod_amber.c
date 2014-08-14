@@ -236,6 +236,7 @@ static apr_status_t amber_filter(ap_filter_t *f, apr_bucket_brigade *bb)
     context = f->ctx;
     if (!context) {
         f->ctx = context = apr_palloc(f->r->pool, sizeof(amber_context_t));
+        context->activity_logged = 0;
     }
 
     if (amber_is_cache_delivery(f)) {
@@ -280,10 +281,11 @@ static apr_status_t amber_filter(ap_filter_t *f, apr_bucket_brigade *bb)
             return ap_pass_brigade(f->next, bb);
         }
 
-        /* This is a metadata bucket indicating the end of the brigade */
+        /* This is a metadata bucket indicating the end of the response */
         if (APR_BUCKET_IS_EOS(bucket)) {
             APR_BUCKET_REMOVE(bucket);
             APR_BRIGADE_INSERT_TAIL(outBB, bucket);
+            f->ctx = context = NULL;
             amber_debug("Filter end");
             return ap_pass_brigade(f->next, outBB);
         }
