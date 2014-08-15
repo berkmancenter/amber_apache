@@ -14,6 +14,87 @@ The Amber plugin consists of two components:
 * cURL
 * php-fpm
 
+## Installation (Ubuntu) ##
+
+Install prerequisites
+
+    sudo apt-get update
+    sudo apt-get -y install git make curl libpcre3 libpcre3-dev sqlite3 libsqlite3-dev php5-cli php5-common php5-sqlite php5-curl php5-fpm zlib1g-dev apache2 apache2-dev libapache2-mod-php5
+
+Get code
+
+    cd /usr/local/src
+    sudo git clone https://github.com/berkmancenter/robustness_common.git
+    sudo git clone https://github.com/berkmancenter/robustness_apache.git
+
+Build module
+
+    cd robustness_apache/
+    apxs -i -a -c mod_amber.c -lsqlite3 -lpcre
+
+Install module
+
+    sudo cp /usr/local/src/robustness_apache/amber.conf /etc/apache2/conf-available
+    sudo /usr/sbin/a2enmod rewrite
+    sudo /usr/sbin/a2enmod substitute
+    sudo /usr/sbin/a2enconf amber.conf
+
+Create amber directories and install supporting files
+
+    sudo mkdir /var/lib/amber /var/www/html/amber /var/www/html/amber/cache
+    sudo touch /var/log/amber
+    sudo ln -s /usr/local/src/robustness_common/src/admin /var/www/html/amber/admin
+    sudo cp -r /usr/local/src/robustness_common/src/css /usr/local/src/robustness_common/src/js /var/www/html/amber
+
+Create amber database and cron jobs
+
+    sudo sqlite3 /var/lib/amber/amber.db < /usr/local/src/robustness_common/src/amber.sql
+    sudo cat > /etc/cron.d/amber << EOF
+    */5 * * * * www-data /bin/sh /usr/local/src/robustness_common/deploy/apache/vagrant/cron-cache.sh --ini=/usr/local/src/robustness_common/src/amber-apache.ini 2>> /var/log/amber >> /var/log/amber
+    15 3 * * *  www-data /bin/sh /usr/local/src/robustness_common/deploy/apache/vagrant/cron-check.sh --ini=/usr/local/src/robustness_common/src/amber-apache.ini 2>> /var/log/amber >> /var/log/amber
+    EOF
+
+Update permissions
+
+    sudo chgrp -R www-data /var/lib/amber /var/www/html/amber
+    sudo chmod -R g+w /var/lib/amber /var/www/html/amber/cache
+    sudo chmod +x /usr/local/src/robustness_common/deploy/apache/vagrant/cron-cache.sh / sudo usr/local/src/robustness_common/deploy/apache/vagrant/cron-check.sh
+    sudo chown www-data /var/log/amber
+    sudo chgrp www-data /var/log/amber
+
+Add the following configuration settings to your virtual hosts configuration file:
+
+    RewriteEngine on
+    RewriteRule ^/amber/cache/([a-fA-F0-9]+)/$ /amber/cache/$1/$1 [T=text/html]
+    RewriteRule ^/amber/admin/$ /amber/admin/reports.php [PT]
+
+    <LocationMatch /amber/cache/[a-fA-F0-9]+/$>
+        <IfModule amber_module>
+            AmberEnabled off
+            AmberCacheDelivery on
+        </IfModule>
+    </LocationMatch>
+
+    # Configuration settings required to display the admin page
+
+    <Location /amber/admin>
+        <IfModule amber_module>
+            AmberEnabled off
+            SetEnv AMBER_CONFIG "/usr/local/src/robustness_common/src/amber-apache.ini"
+        </IfModule>
+    </Location>
+
+Reload apache
+
+    sudo service apache2 reload    
+
+## Troublshooting - Apache plugin ##
+
+The deflate module can prevent the substitute module from working properly, if they are run in the wrong order. If the Amber javascript and CSS are not being inserted properly, try disabling deflate:
+
+    /usr/sbin/a2dismod deflate
+
+
 ## Configuration - Apache plugin ##
 
 The Amber apache plugin uses the following configuration directives. See the provided amber.conf for examples. 
