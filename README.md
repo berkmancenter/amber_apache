@@ -29,7 +29,7 @@ Get code
 
 Build module
 
-    cd robustness_apache/
+    cd robustness_apache
     apxs -i -a -c mod_amber.c -lsqlite3 -lpcre
 
 Install module
@@ -58,7 +58,7 @@ Update permissions
 
     sudo chgrp -R www-data /var/lib/amber /var/www/html/amber
     sudo chmod -R g+w /var/lib/amber /var/www/html/amber/cache
-    sudo chmod +x /usr/local/src/robustness_common/deploy/apache/vagrant/cron-cache.sh / sudo usr/local/src/robustness_common/deploy/apache/vagrant/cron-check.sh
+    sudo chmod +x /usr/local/src/robustness_common/deploy/apache/vagrant/cron-cache.sh /usr/local/src/robustness_common/deploy/apache/vagrant/cron-check.sh
     sudo chown www-data /var/log/amber
     sudo chgrp www-data /var/log/amber
 
