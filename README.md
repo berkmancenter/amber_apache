@@ -88,7 +88,7 @@ Reload apache
 
     sudo service apache2 reload    
 
-## Troublshooting - Apache plugin ##
+## Troubleshooting - Apache plugin ##
 
 The deflate module can prevent the substitute module from working properly, if they are run in the wrong order. If the Amber javascript and CSS are not being inserted properly, try disabling deflate:
 
