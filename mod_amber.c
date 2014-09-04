@@ -1003,7 +1003,7 @@ int amber_get_behavior(amber_options_t *options, unsigned char *out, int status)
 
         }
     }
-    if (strlen(options->country)) {
+    if (options->country && strlen(options->country)) {
         char country_attribute[AMBER_MAX_ATTRIBUTE_STRING];
         if (status == AMBER_STATUS_UP) {
             switch (options->country_behavior_up) {
