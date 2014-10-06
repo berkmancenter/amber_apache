@@ -913,7 +913,7 @@ static int amber_db_enqueue_url(ap_filter_t *f, sqlite3 *sqlite_handle, char *ur
 
 
 /* ======================================================================== */
-/* Amber Utilities - from amber_utils.c in robustness_nginx                 */   
+/* Amber Utilities - from amber_utils.c in amber_nginx                 */   
 /* Platform-independent and could be moved to a separate file               */
 /* ======================================================================== */
 
