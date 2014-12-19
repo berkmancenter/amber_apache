@@ -28,7 +28,7 @@ Get code.
 Install amber using the amber-install.sh script. This will download the prerequisites, create the database and configure the paths for the amber module.
 
     cd /usr/local/src/amber_apache
-    sudo ./amber-install
+    sudo ./amber-install.sh
 
 
 Add the following configuration settings to your virtual hosts configuration file:
