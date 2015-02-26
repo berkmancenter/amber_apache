@@ -941,7 +941,7 @@ int amber_build_attribute(amber_options_t *options, unsigned char *out, char *lo
         strftime(date_string,AMBER_MAX_DATE_STRING,"%FT%T%z",timeinfo);
         snprintf((char *)out,
              AMBER_MAX_ATTRIBUTE_STRING,
-             "data-cache='/%s %s' data-amber-behavior='%s' ",
+             "data-versionurl='/%s' data-versiondate='%s' data-amber-behavior='%s' ",
              location,
              date_string,
              behavior
