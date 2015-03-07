@@ -142,6 +142,13 @@ Display Farsi version of Javascript and CSS
     AddOutputFilterByType SUBSTITUTE text/html
     Substitute "s|</head>|<script type="text/javascript">var amber_locale="fa";</script><script type="text/javascript" src="/amber/js/amber.js"></script><link rel="stylesheet" type="text/css" href="/amber/css/amber.css"><link rel="stylesheet" type="text/css" href="/amber/css/amber_fa.css"></head>|niq"
 
+## Configuration - Sandboxing ##
+
+For improved security, you may want to have cached content served from a separate domain. Here is a sample rewrite rule where the site is running at www.amber.com, while cached content is served from sandbox.amber.com.
+
+    RewriteCond %{HTTP_HOST} ^www.amber.com$
+    RewriteRule /amber/cache/[a-fA-F0-9]+/$ http://sandbox.amber.com%{REQUEST_URI} [R=301,L]
+
 ## Configuration - Caching ##
 
 The caching process is configured through ```amber.ini``` - full documentation is available within the sample configuration file [here](https://github.com/berkmancenter/amber_common/blob/master/src/amber.ini) 
