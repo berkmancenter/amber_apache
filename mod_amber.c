@@ -1,4 +1,5 @@
 #include "httpd.h"
+#include "http_core.h"
 #include "http_config.h"
 #include "http_protocol.h"
 #include "ap_config.h"
@@ -75,6 +76,7 @@ static size_t           amber_insert_attributes(ap_filter_t *f, amber_matches_t 
 static char*            get_cache_item_id(ap_filter_t *f);
 static int              amber_log_activity(ap_filter_t *f);
 static int              amber_set_cache_content_type(ap_filter_t *f);
+static char*            get_absolute_url(ap_filter_t *f, char *location);
 
 /* Functions that interact with the database */
 static sqlite3*         amber_db_get_database(ap_filter_t *f, char *db_path);
@@ -862,8 +864,9 @@ static int amber_db_get_attribute(ap_filter_t *f, sqlite3 *sqlite_handle, sqlite
     } else {
         amber_options_t *options = (amber_options_t*) ap_get_module_config(f->r->per_dir_config, &amber_module); 
 
+        char *url = get_absolute_url(f, location);
         char *attribute = apr_pcalloc(f->r->pool, AMBER_MAX_ATTRIBUTE_STRING * sizeof(char));
-        if ((rc = amber_build_attribute(options, (unsigned char *)attribute, location, status, date))) {
+        if ((rc = amber_build_attribute(options, (unsigned char *)attribute, url, status, date))) {
             amber_error1("Amber: error generating attribute string (%d)", rc);
             return AMBER_CACHE_ATTRIBUTES_ERROR;
         }
@@ -872,6 +875,26 @@ static int amber_db_get_attribute(ap_filter_t *f, sqlite3 *sqlite_handle, sqlite
     }
 
     return AMBER_CACHE_ATTRIBUTES_FOUND;
+}
+
+/**
+ * Get the absolute URL on this server for a URL relative to the root
+ * @param  f        the filter
+ * @param  location a URL relative to the root
+ * @return          an absolute URL to the resource
+ */
+static char *get_absolute_url(ap_filter_t *f, char *location) {
+    char *scheme = (char *)ap_http_scheme(f->r);
+    char *hostname = f->r->server->server_hostname;
+    int port = ap_get_server_port(f->r);
+    char *url = apr_pcalloc(f->r->pool, (strlen(hostname) + strlen(location)) * sizeof(char));
+    if (port == 80) {
+        sprintf(url, "%s://%s/%s", scheme, hostname, location);
+    } else {
+        sprintf(url, "%s://%s:%d/%s", scheme, hostname, port, location);    
+    }
+    
+    return url;
 }
 
 /**
@@ -941,7 +964,7 @@ int amber_build_attribute(amber_options_t *options, unsigned char *out, char *lo
         strftime(date_string,AMBER_MAX_DATE_STRING,"%FT%T%z",timeinfo);
         snprintf((char *)out,
              AMBER_MAX_ATTRIBUTE_STRING,
-             "data-versionurl='/%s' data-versiondate='%s' data-amber-behavior='%s' ",
+             "data-versionurl='%s' data-versiondate='%s' data-amber-behavior='%s' ",
              location,
              date_string,
              behavior
