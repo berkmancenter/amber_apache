@@ -7,6 +7,7 @@
 #include "http_log.h"
 #include "pcre.h"
 #include <sqlite3.h>
+#include <time.h>
 
 #define AMBER_ACTION_NONE     0
 #define AMBER_ACTION_HOVER    1
@@ -75,7 +76,7 @@ static amber_matches_t  find_links_in_buffer(ap_filter_t *f, const char *buffer,
 static size_t           amber_insert_attributes(ap_filter_t *f, amber_matches_t links, const char *old_buffer, size_t old_buffer_size, const char *new_buffer, size_t new_buffer_size);
 static char*            get_cache_item_id(ap_filter_t *f);
 static int              amber_log_activity(ap_filter_t *f);
-static int              amber_set_cache_content_type(ap_filter_t *f);
+static int              amber_set_cache_delivery_headers(ap_filter_t *f);
 static char*            get_absolute_url(ap_filter_t *f, char *location);
 
 /* Functions that interact with the database */
@@ -87,7 +88,7 @@ static sqlite3_stmt*    amber_db_get_statement(ap_filter_t *f, sqlite3 *sqlite_h
 static sqlite3_stmt*    amber_db_get_url_lookup_query(ap_filter_t *f, sqlite3 *sqlite_handle);
 static sqlite3_stmt*    amber_db_get_enqueue_url_query(ap_filter_t *f, sqlite3 *sqlite_handle);
 static sqlite3_stmt*    amber_db_get_log_activity_query(ap_filter_t *f, sqlite3 *sqlite_handle);
-static sqlite3_stmt*    amber_db_get_content_type_query(ap_filter_t *f, sqlite3 *sqlite_handle);
+static sqlite3_stmt*    amber_db_get_content_type_date_query(ap_filter_t *f, sqlite3 *sqlite_handle);
 static int              amber_db_enqueue_url(ap_filter_t *f, sqlite3 *sqlite_handle, char *url);
 static int              amber_db_get_attribute(ap_filter_t *f, sqlite3 *sqlite_handle, sqlite3_stmt *sqlite_statement, char * url, char **result);
 
@@ -245,7 +246,7 @@ static apr_status_t amber_filter(ap_filter_t *f, apr_bucket_brigade *bb)
         amber_debug("Delivering cached item");
         if (!context->activity_logged) {
             amber_log_activity(f);
-            amber_set_cache_content_type(f);
+            amber_set_cache_delivery_headers(f);
         }
         return ap_pass_brigade(f->next, bb);
     }
@@ -645,11 +646,11 @@ static int amber_log_activity(ap_filter_t *f) {
 }
 
 /**
- * Set the content-type of a cached item that we're returning from the cache
+ * Set the content-type and Memento headers for an item that we're returning from the cache
  * @param f the filter
  * @return 0 on success
  */
-static int amber_set_cache_content_type(ap_filter_t *f) {
+static int amber_set_cache_delivery_headers(ap_filter_t *f) {
     int sqlite_rc;
     char *cache_id = get_cache_item_id(f);
 
@@ -662,7 +663,7 @@ static int amber_set_cache_content_type(ap_filter_t *f) {
             return -1;
         }
 
-        sqlite3_stmt *sqlite_statement = amber_db_get_content_type_query(f,sqlite_handle);
+        sqlite3_stmt *sqlite_statement = amber_db_get_content_type_date_query(f,sqlite_handle);
         if (!sqlite_statement) {
             return -1;
         }
@@ -678,9 +679,27 @@ static int amber_set_cache_content_type(ap_filter_t *f) {
         if (sqlite_rc == SQLITE_DONE) { /* No data returned */
             amber_debug1("No content type found when serving cache item: %s", cache_id); 
         } else if (sqlite_rc == SQLITE_ROW) {
+            /* Set the Content-Type header */
             char *mimetype = (char *)sqlite3_column_text(sqlite_statement,0);
             strncpy((char *)f->r->content_type, mimetype, strlen(mimetype));
             amber_debug2("Set content type for cache item (%s): %s", cache_id, mimetype);
+
+            /* Set the Memento-Datetime header */
+            const int MEMENTO_TIME_HEADER_SIZE = 40;
+            long cache_date = sqlite3_column_int(sqlite_statement, 1);
+            struct tm * t = gmtime((const time_t*) &cache_date);
+            if (!t) {
+                amber_error1("Error calculating Memento-Datetime response header: %s", cache_id); 
+            } else {
+                char *memento_time = apr_pcalloc(f->r->pool, MEMENTO_TIME_HEADER_SIZE * sizeof(char));
+                if (!memento_time) {
+                    amber_error1("Error allocating memory for Memento-Datetime response header: %s", cache_id); 
+                } else {
+                    strftime(memento_time, MEMENTO_TIME_HEADER_SIZE * sizeof(char), "%a, %d %b %Y %H:%M:%S %Z", t);
+                    apr_table_set(f->r->headers_out, "Memento-Datetime", memento_time);
+                    amber_debug2("Set Memento-Datetime for cache item (%s): %s", cache_id, memento_time);
+                }
+            }
 
         } else {
             amber_error2("Error retrieving cache item content type: %s (%d)", cache_id, sqlite_rc);
@@ -795,13 +814,13 @@ static sqlite3_stmt *amber_db_get_log_activity_query(ap_filter_t *f, sqlite3 *sq
 }
 
 /**
- * Prepare a sql query for getting the mime-type of a cached item
+ * Prepare a sql query for getting the mime-type and cache date of a cached item
  * @param f the filter
  * @param sqlite_handle handle to the database to use
  * @return sqlite_statement to be executed
  */
-static sqlite3_stmt *amber_db_get_content_type_query(ap_filter_t *f, sqlite3 *sqlite_handle) {
-    return amber_db_get_statement(f, sqlite_handle, "SELECT type FROM amber_cache WHERE id = ?");
+static sqlite3_stmt *amber_db_get_content_type_date_query(ap_filter_t *f, sqlite3 *sqlite_handle) {
+    return amber_db_get_statement(f, sqlite_handle, "SELECT type, date FROM amber_cache WHERE id = ?");
 }
 
 /**
