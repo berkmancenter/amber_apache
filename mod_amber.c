@@ -959,7 +959,7 @@ static int amber_db_enqueue_url(ap_filter_t *f, sqlite3 *sqlite_handle, char *ur
 /* Platform-independent and could be moved to a separate file               */
 /* ======================================================================== */
 
-#define AMBER_MAX_BEHAVIOR_STRING 20
+#define AMBER_MAX_BEHAVIOR_STRING 100
 #define AMBER_MAX_DATE_STRING 30
 
 /* Create a string containing attributes to be added to the HREF
