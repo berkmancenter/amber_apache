@@ -887,7 +887,7 @@ static char *get_absolute_url(ap_filter_t *f, char *location) {
     char *scheme = (char *)ap_http_scheme(f->r);
     char *hostname = f->r->server->server_hostname;
     int port = ap_get_server_port(f->r);
-    char *url = apr_pcalloc(f->r->pool, (strlen(hostname) + strlen(location)) * sizeof(char));
+    char *url = apr_pcalloc(f->r->pool, (strlen(scheme) + strlen(hostname) + strlen(location) + 15) * sizeof(char));
     if (port == 80) {
         sprintf(url, "%s://%s/%s", scheme, hostname, location);
     } else {
