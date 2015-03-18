@@ -904,7 +904,7 @@ static int amber_db_get_attribute(ap_filter_t *f, sqlite3 *sqlite_handle, sqlite
  */
 static char *get_absolute_url(ap_filter_t *f, char *location) {
     char *scheme = (char *)ap_http_scheme(f->r);
-    char *hostname = f->r->server->server_hostname;
+    char *hostname = (char*) (f->r->hostname ? f->r->hostname : f->r->server->server_hostname);
     int port = ap_get_server_port(f->r);
     char *url = apr_pcalloc(f->r->pool, (strlen(scheme) + strlen(hostname) + strlen(location) + 15) * sizeof(char));
     if (port == 80) {
