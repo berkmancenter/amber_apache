@@ -78,6 +78,7 @@ static char*            get_cache_item_id(ap_filter_t *f);
 static int              amber_log_activity(ap_filter_t *f);
 static int              amber_set_cache_delivery_headers(ap_filter_t *f);
 static char*            get_absolute_url(ap_filter_t *f, char *location);
+static size_t           get_maximum_attribute_size(ap_filter_t *f);
 
 /* Functions that interact with the database */
 static sqlite3*         amber_db_get_database(ap_filter_t *f, char *db_path);
@@ -388,8 +389,8 @@ static apr_bucket* amber_process_bucket(ap_filter_t *f, apr_bucket *bucket, cons
 
     /* If there are links to evaluate, create a new buffer for the updated links. 
        Allocate additional memory for the HTML attributes we are going to add */
-    size_t AMBER_ATTRIBUTES_SIZE = 200;
-    size_t new_buffer_memory_allocated = buffer_size + (links.count * sizeof(char) * AMBER_ATTRIBUTES_SIZE);
+    size_t amber_attributes_size = get_maximum_attribute_size(f);
+    size_t new_buffer_memory_allocated = buffer_size + (links.count * sizeof(char) * amber_attributes_size);
     char *new_buffer = apr_bucket_alloc( new_buffer_memory_allocated, f->c->bucket_alloc);
 
     size_t new_bucket_size = amber_insert_attributes(f, links, buffer, buffer_size, new_buffer, new_buffer_memory_allocated);
@@ -912,9 +913,17 @@ static char *get_absolute_url(ap_filter_t *f, char *location) {
     } else {
         sprintf(url, "%s://%s:%d/%s", scheme, hostname, port, location);    
     }
-    
     return url;
 }
+
+/* Get the maximum possible size for the attributes that will be added to a link */
+static size_t get_maximum_attribute_size(ap_filter_t *f) {
+    size_t result = 0;
+    result += strlen(" data-versionurl='X' data-versiondate='0000-00-00T00:00:00+0000' data-amber-behavior='down hover:000,zz down hover:000' ");
+    result += strlen(get_absolute_url(f, "amber/cache/12345678901234567890123456789012/"));
+    result += 30; /* Additional padding */ 
+    return result;
+}                                                    
 
 /**
  * Add the URL to the amber_queue table so that it will be cached during the next caching run
