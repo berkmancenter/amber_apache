@@ -144,7 +144,7 @@ Display Farsi version of Javascript and CSS
 
 ## Configuration - Sandboxing ##
 
-For improved security, you may want to have cached content served from a separate domain. Here is a sample rewrite rule where the site is running at www.amber.com, while cached content is served from sandbox.amber.com.
+For improved security, you must next configure Amber to serve cached content from a separate domain. We recommend that you establish a subdomain for this purpose. Here is a sample rewrite rule where the site is running at www.amber.com, while cached content is served from sandbox.amber.com.
 
     RewriteCond %{HTTP_HOST} ^www.amber.com$
     RewriteRule /amber/cache/[a-fA-F0-9]+/$ http://sandbox.amber.com%{REQUEST_URI} [R=301,L]
