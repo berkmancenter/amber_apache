@@ -517,7 +517,8 @@ static size_t amber_insert_attributes(ap_filter_t *f, amber_matches_t links, con
         return 0;
     }
 
-    for (int i = 0; i < links.count; i++) {  
+    int i;
+    for (i = 0; i < links.count; i++) {  
 
         /* Copy the data up to the insertion point for the next match */
         copy_size = links.insert_pos[i] + old_buffer - src;

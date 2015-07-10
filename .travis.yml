@@ -1,11 +1,11 @@
 language: c
 
 before_install:
-  - sudo apt-get update > /dev/null
-  - sudo apt-get install -y --force-yes apache2 apache2-dev
+  - sudo apt-get -qq update
+  - sudo apt-get -qq install -y --force-yes apache2 apache2-dev
 
 install:
   - git clone https://github.com/berkmancenter/amber_apache.git
   
 script: 
-  - sudo apxs -i -a -c mod_amber.c
+  - sudo /usr/bin/apxs2 -i -a -c mod_amber.c
