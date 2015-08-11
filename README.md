@@ -26,7 +26,6 @@ The Amber plugin consists of two components:
 #### Representations ####
 This documentation contains the following representations:
 * **$BUILDDIR** -We represent the build directory as $BUILDDIR. (For example, in our install our build directory was /usr/local/src)
-* * **$BUILDDIR** -We represent the build directory as $BUILDDIR. (For example, in our install our build directory was /usr/sbin)
 * **$DATADIR** -We represent the data directory as $DATADIR. (For example, in our install our data directory was /var/lib)
 * **$LOGDIR** -We represent the log directory as $LOGDIR. (For example, in our install our log directory was /var/log)
 * **$WEBROOT** -We represent the default path as $WEBROOT. (For example, in our install our path was /var/www/html)
